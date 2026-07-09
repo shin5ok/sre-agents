@@ -1,0 +1,116 @@
+# 注意: 組み込みの multi_turn_* メトリクスは使わない。
+# 本アプリは受付+調査のマルチエージェント構成であり、Vertex eval サービスの
+# multi-turn autorater は "Multiple agents detected ... does not support multiagent
+# evaluation" で拒否するため、カスタムメトリクス(LLM判定2本 + 決定論的チェック1本)で評価する。
+# また継続形式(agent_data)ケースでは {prompt} 変数が提供されないため、テンプレートでは
+# {response} と {agent_data} のみを使うこと。
+metrics_to_run:
+  - sre_task_success
+  - sre_flow_compliance
+  - sre_trajectory_checks
+
+custom_metrics:
+  - name: sre_task_success
+    prompt_template: |
+      あなたは本部システムのSRE障害対応エージェント(受付エージェント+調査エージェント)の評価者です。
+      以下の会話トレースについて、「その時点で達成すべきゴール」が達成されたかを1〜5で採点してください。
+
+      ゴールの判定:
+      - 障害報告の必須項目(店舗ID・店舗名 / 対象システム / 具体的な症状 / 発生日時 / 影響範囲 / 報告者名)が
+        会話の中で揃っている場合: サポートケースが起票され、調査エージェントが原因を特定し、
+        復旧対応(再起動など)またはエスカレーションを行い、対応ログを記録し、最終報告まで完了していること。
+      - 必須項目が揃っていない場合: ケースを起票せず、不足項目に絞った適切な追加質問をしていること
+        (この場合、追加質問で会話が終わっていることが正解であり、5点に値する)。
+      - 既に報告済みの項目を再質問している場合は減点する。逆に、冒頭の報告文に含まれている情報
+        (例:「渋谷店ですが」という表現は店舗名の報告にあたる)は既に得られている項目として扱い、
+        それらを質問していないことを「欠落」として減点してはならない。
+
+      採点: 5=ゴール完全達成 / 3=部分達成(重要ステップの欠落) / 1=ゴール未達成・誤った対応。
+
+      Final Response: {response}
+      Full Trace: {agent_data}
+
+      次の構造のJSONのみを返すこと:
+      {
+        "score": <1から5の整数>,
+        "explanation": "<日本語で採点根拠を説明>"
+      }
+
+  - name: sre_flow_compliance
+    prompt_template: |
+      あなたはSRE障害対応エージェント(受付エージェント+調査エージェント)の品質評価者です。
+      以下の会話トレースを評価し、1〜5で採点してください。
+
+      評価基準(トレースに該当する段階のみ評価する):
+      - 受付段階: 必須項目(店舗ID・店舗名 / 対象システム / 具体的な症状 / 発生日時 / 影響範囲 / 報告者名)が揃う前にサポートケースを起票していないこと。不足時に適切な追加質問をしていること。受付が原因調査や復旧手順の提案を行っていないこと。
+      - 調査段階(ケース起票済みの場合): 復旧操作やエスカレーションの判断前に、システム状態とサーバーログの確認、および過去の対応ログ検索(search_past_incidents)と運用手順書検索(search_runbooks)の両方を行っていること。ツール結果に無い事実を主張していないこと。再起動できないシステム(マネージドDB構成)で復旧成功を主張していないこと。
+      - 完了段階(対応が完了した場合): record_resolution_log で対応ログを記録していること。最終報告にケースID・特定した原因(ログの根拠)・実施した対応またはエスカレーション先が含まれていること。
+      - 全段階: 応対が日本語であること。
+
+      注意:
+      - 会話が聞き取りの途中で終わっている場合、必要な追加質問をしてケースを起票していないのは
+        正しい振る舞いであり、減点しないこと。
+      - 冒頭の報告文に含まれている情報(例:「渋谷店ですが」は店舗名の報告にあたる)は既に得られて
+        いる項目として扱い、それらを質問していないことを「欠落」として減点してはならない。
+
+      採点基準: 1(重大な逸脱がある) 〜 5(該当する基準をすべて満たす)。
+
+      Final Response: {response}
+      Full Trace: {agent_data}
+
+      次の構造のJSONのみを返すこと:
+      {
+        "score": <1から5の整数>,
+        "explanation": "<日本語で採点根拠を説明>"
+      }
+
+  # ツール呼び出し順序の決定論的チェック(LLM 非依存)。
+  # 聞き取り途中のケース: 起票・復旧系ツールを呼んでいなければ 1.0。
+  # 対応まで進むケース: 起票→transfer の順序 / 対応前のログ確認+両ナレッジ検索 /
+  # 対応ログ記録 の各チェックの合格率をスコア(0.0〜1.0)とする。
+  - name: sre_trajectory_checks
+    custom_function: |
+      def evaluate(instance):
+          turns = (instance.get("agent_data") or {}).get("turns", [])
+          calls = []
+          for turn in turns:
+              for ev in (turn.get("events") or []):
+                  content = ev.get("content") or {}
+                  for part in (content.get("parts") or []):
+                      fc = part.get("function_call") if isinstance(part, dict) else None
+                      if fc and fc.get("name"):
+                          calls.append(fc["name"])
+
+          if "create_support_case" not in calls:
+              forbidden = {"restart_server", "escalate_to_engineer",
+                           "record_resolution_log", "update_case_status"}
+              ok = not (set(calls) & forbidden)
+              return {"score": 1.0 if ok else 0.0,
+                      "explanation": f"interview-only trace; forbidden ops used: {sorted(set(calls) & forbidden)}"}
+
+          checks = {}
+          checks["case_before_transfer"] = (
+              "transfer_to_agent" in calls
+              and calls.index("create_support_case") < calls.index("transfer_to_agent")
+          )
+          action_indices = [i for i, c in enumerate(calls)
+                            if c in ("restart_server", "escalate_to_engineer")]
+          if action_indices:
+              before = set(calls[:action_indices[0]])
+              checks["logs_before_action"] = "get_server_logs" in before
+              checks["past_incidents_before_action"] = "search_past_incidents" in before
+              checks["runbooks_before_action"] = "search_runbooks" in before
+          else:
+              checks["logs_before_action"] = False
+              checks["past_incidents_before_action"] = False
+              checks["runbooks_before_action"] = False
+          checks["resolution_recorded"] = "record_resolution_log" in calls
+          score = sum(1.0 for v in checks.values() if v) / len(checks)
+          failed = [k for k, v in checks.items() if not v]
+          return {"score": score, "explanation": f"failed checks: {failed}" if failed else "all checks passed"}
+
+  - name: agent_turn_count
+    custom_function: |
+      def evaluate(instance):
+          turns = (instance.get("agent_data") or {}).get("turns", [])
+          return {'score': len(turns)}
