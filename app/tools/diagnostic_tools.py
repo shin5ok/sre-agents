@@ -40,20 +40,26 @@ def get_system_status(system_id: str, tool_context: ToolContext) -> dict:
         return {"status": "error", "message": f"未知のシステムIDです: {system_id}"}
     remediated = tool_context.state.get("remediated_systems") or []
     if system_id in remediated:
-        return {
+        result = {
             "status": "success",
             "system_id": system_id,
             "display_name": entry["display_name"],
             "operational_status": "healthy",
             "detail": entry["healthy_detail"],
         }
-    return {
-        "status": "success",
-        "system_id": system_id,
-        "display_name": entry["display_name"],
-        "operational_status": entry["status"],
-        "detail": entry["status_detail"],
-    }
+    else:
+        result = {
+            "status": "success",
+            "system_id": system_id,
+            "display_name": entry["display_name"],
+            "operational_status": entry["status"],
+            "detail": entry["status_detail"],
+        }
+    # GCPホストのシステムのみ platform を持つ(調査エージェントが
+    # Cloud Assist での GCP 層調査に切り替える判断材料)
+    if "platform" in entry:
+        result["platform"] = entry["platform"]
+    return result
 
 
 def get_server_logs(system_id: str) -> dict:

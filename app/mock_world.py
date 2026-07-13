@@ -4,6 +4,10 @@
 eval の安定性のため、乱数や現在時刻に依存する値を一切含めない。
 シナリオ整合: 各システムのログ異常は data/runbooks/ の既知事象および
 scripts/seed_firestore.py の過去対応ログと同じ結論(再起動 or エスカレーション)を指す。
+
+store-app のみ「GCP実環境と接続する例」: ここにあるのは外形監視の抜粋だけで、
+クラウド側の実体(Cloud Run サービス)は scripts/gcp_incident.sh で
+SANDBOX_PROJECT_ID のプロジェクトに作成し、Gemini Cloud Assist(MCP)で調査する。
 """
 
 SYSTEMS: dict[str, dict] = {
@@ -48,6 +52,36 @@ SYSTEMS: dict[str, dict] = {
             "2026-07-09 07:45:12.001 ERROR [scheduler-1] c.e.inv.batch.StockSyncJob - job aborted after 213/1200 stores",
             "java.lang.OutOfMemoryError: Java heap space",
             "2026-07-09 07:46:30.514 WARN  [http-nio-8080-exec-2] c.e.inv.api.StockController - GET /api/v1/stock latency=31022ms store=1102",
+        ],
+    },
+    "store-app": {
+        "display_name": "店舗アプリAPI",
+        "description": (
+            "店舗スタッフ向けアプリ・モバイルオーダーのバックエンドAPI"
+            "(GCPサンドボックスプロジェクト上の Cloud Run サービス store-app)"
+        ),
+        "platform": "Cloud Run(GCPサンドボックスプロジェクト / asia-northeast1)",
+        "status": "degraded",
+        "status_detail": (
+            "外形監視で HTTP 500 を多数検知(エラー率90%超、p95レイテンシ2.1秒)。"
+            "クラウド側のアプリケーションログは本ツールからは参照不可"
+            "(Gemini Cloud Assist で GCP 側を調査すること)。"
+        ),
+        "restartable": False,
+        "restart_block_reason": (
+            "Cloud Run のフルマネージドサービスのため、"
+            "従来型のサーバー再起動の対象外です。"
+        ),
+        "healthy_detail": "外形監視 全チェック 200 OK(p95レイテンシ310ms)",
+        "log_excerpt": [
+            "2026-07-13 09:12:04.101 INFO  [synthetic-monitor] GET https://store-app-*.run.app/ -> 500 (2043ms) probe=tokyo-1",
+            "2026-07-13 09:12:34.144 INFO  [synthetic-monitor] GET https://store-app-*.run.app/ -> 500 (1988ms) probe=tokyo-2",
+            "2026-07-13 09:13:04.190 ERROR [edge-gateway] upstream error: store-app (Cloud Run) returned 5xx for 27/30 requests in last 60s",
+            "2026-07-13 09:13:04.191 WARN  [edge-gateway] Cloud Run 側のアプリケーションログは本ゲートウェイからは参照できません。GCP側の調査には Gemini Cloud Assist を使用してください。",
+            "2026-07-13 09:13:34.226 INFO  [synthetic-monitor] GET https://store-app-*.run.app/healthz -> 200 (95ms) probe=tokyo-1",
+            "2026-07-13 09:14:04.233 INFO  [synthetic-monitor] GET https://store-app-*.run.app/ -> 500 (2101ms) probe=tokyo-1",
+            "2026-07-13 09:14:34.301 ERROR [edge-gateway] upstream error: store-app (Cloud Run) returned 5xx for 28/30 requests in last 60s",
+            "2026-07-13 09:15:04.377 INFO  [synthetic-monitor] GET https://store-app-*.run.app/ -> 500 (1967ms) probe=tokyo-2",
         ],
     },
     "order-mgmt": {

@@ -36,6 +36,7 @@ def test_log_excerpts_contain_expected_anomalies():
         "sales-mgmt": "HikariPool-1 - Connection is not available",
         "inventory-mgmt": "java.lang.OutOfMemoryError",
         "order-mgmt": "No space left on device",
+        "store-app": "returned 5xx",
     }
     for system_id, marker in anomalies.items():
         joined = "\n".join(SYSTEMS[system_id]["log_excerpt"])

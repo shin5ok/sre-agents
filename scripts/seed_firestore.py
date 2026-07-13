@@ -82,6 +82,39 @@ SEED_INCIDENTS: list[dict] = [
         "recorded_at": "2026-03-30T13:10:00+09:00",
         "source": "seed",
     },
+    {
+        "incident_id": "INC-2026-0006",
+        "case_id": None,
+        "system_id": "store-app",
+        "title": "店舗アプリAPIの5xx多発(Cloud Run 環境変数の設定不備)",
+        "symptom": "店舗スタッフ向けアプリの操作が全店でエラー。外形監視で HTTP 500 多発(/healthz は 200)。",
+        "root_cause": (
+            "Cloud Run サービス store-app の環境変数の設定不備。アプリがDB接続"
+            "タイムアウト(DB connection failed: could not connect to server "
+            "db.internal:5432)を起こし全リクエストが500を返していた。"
+            "Gemini Cloud Assist の調査でエラーログと直前のリビジョン更新"
+            "(環境変数変更)を特定。"
+        ),
+        "action_taken": (
+            "Cloud Run はアプリ側からの再起動対象外のためインフラ運用チームへ"
+            "エスカレーション。環境変数を修正した新リビジョンのデプロイで復旧。"
+            "エスカレーション時に Cloud Assist で特定したログとリビジョン情報を添付。"
+        ),
+        "outcome": "escalated",
+        "escalated": True,
+        "tags": [
+            "店舗アプリ",
+            "Cloud Run",
+            "GCP",
+            "5xx",
+            "環境変数",
+            "エスカレーション",
+            "Cloud Assist",
+        ],
+        "occurred_at": "2026-05-27",
+        "recorded_at": "2026-05-27T18:45:00+09:00",
+        "source": "seed",
+    },
 ]
 
 

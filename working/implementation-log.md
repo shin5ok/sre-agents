@@ -459,3 +459,49 @@ investigation: update_case_status → get_system_status → get_server_logs
              → record_resolution_log → update_case_status("resolved")
 ```
 propose の後に続けて実施系ツールを呼び、対応ログ記録まで完了。
+
+---
+
+## 2026-07-13: GCP障害シナリオ + Gemini Cloud Assist MCP 連携
+
+**ゴール**: GCPの障害の例を追加し、Gemini Cloud Assist(リモートMCP)で実GCP環境を
+調査できるようにする。調査対象プロジェクトIDは環境変数 `SANDBOX_PROJECT_ID` から取得。
+
+### 追加・変更点
+
+- `app/tools/gcp_assist.py`(新規): Cloud Assist リモートMCP
+  (`https://geminicloudassist.googleapis.com/mcp` / Streamable HTTP)の `McpToolset`。
+  - 認証: `header_provider` で ADC のアクセストークンを毎回供給(期限切れは自動refresh)。
+    quota project 未設定の資格情報には `x-goog-user-project: $SANDBOX_PROJECT_ID` を付与。
+  - `tool_filter=["investigate_issue", "ask_cloud_assist"]` — mutative な
+    `invoke_operation` / `design_infra` / `optimize_costs` は意図的に非公開。
+  - `SANDBOX_PROJECT_ID` 未設定なら None(eval / CI は従来と完全同一の構成)。
+  - `sse_read_timeout=110s`(agents-cli run の SSE 120s 切断より短く)。
+- `app/config.py`: `get_sandbox_project_id()` 追加。
+- `app/sub_agents/investigation.py`: SANDBOX_PROJECT_ID 設定時のみ instruction に
+  「GCP層の調査(Cloud Assist)」節を追記("projects/<id>" を展開、contextId 引き継ぎ、
+  読み取り専用の縛り、タイムアウト時の再試行1回)+ ツールセットを追加。
+- `app/mock_world.py`: 4つ目のシステム `store-app`(店舗アプリAPI / Cloud Run)。
+  モック側は外形監視の抜粋のみ(HTTP 500 多発、/healthz は 200)で、真因は
+  Cloud Assist 経由でしか特定できない設計。`platform` キーで GCPホストを示す
+  (`get_system_status` が platform をパススルー)。
+- `data/runbooks/store-app.md`: Cloud Assist での調査手順と既知事象(環境変数設定不備
+  → エスカレーション)。`scripts/seed_firestore.py`: INC-2026-0006 追加(計6件)。
+- GCP障害の実体: `scripts/gcp_incident_app/`(Flask、`FAIL_MODE=db_timeout` で
+  DB接続タイムアウト風 ERROR ログ + 500)+ `scripts/gcp_incident.sh`
+  (setup/deploy/expose/break/status/resolve/clean)+ `make gcp-incident-*`。
+  デプロイは認証必須が既定(公開は `expose` の明示実行のみ)。組織ポリシーで
+  未認証が拒否される環境では ID トークンで自動フォールバック。
+
+### 検証結果(初回は sandbox = your-project-id で実施 → 後に your-sandbox-project-id へ切替、旧サービスは削除済み)
+
+- MCP `tools/list`(認証不要): OK。ADK `McpToolset.get_tools()` 経由でも
+  `['ask_cloud_assist', 'investigate_issue']` を取得(認証ヘッダー供給経路も通過)。
+- `deploy` → 5x 200 / `break` → 15x 500、Cloud Logging に severity=ERROR の
+  `DB connection failed: could not connect to server db.internal:5432` を確認。
+- 認証付き `tools/call` は **"The caller does not have permission"** — `roles/owner`
+  だけでは不足(プレビューの `mcp.tools.call`)。`roles/mcp.toolUser`(GA)+
+  `roles/geminicloudassist.user`(BETA)の付与が必要で、`gcp_incident.sh setup` に
+  組み込み済み(このセッションでは IAM 変更が承認されず人間の実行待ち)。
+- ユニットテスト 29 件 / `agents-cli lint` 全て pass。eval への影響なし
+  (eval は SANDBOX_PROJECT_ID なしで実行される)。

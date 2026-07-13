@@ -6,7 +6,9 @@ REGION ?= asia-northeast1
 FIRESTORE_DB ?= sre-agents
 PROMPT ?= 渋谷店(店舗ID:1102)です。売上管理システムで今朝9時頃からレジ2台の会計時に売上送信がタイムアウトします。報告者は佐藤です。以上の内容で対応をお願いします。
 
-.PHONY: all install db-create seed run chat playground test eval eval-compare lint deploy-setup deploy
+.PHONY: all install db-create seed run chat playground test eval eval-compare lint deploy-setup deploy \
+	gcp-incident-create gcp-incident-status gcp-incident-resolve gcp-incident-clean \
+	gce-incident-create gce-incident-break gce-incident-status gce-incident-resolve gce-incident-clean
 
 all: install seed test
 
@@ -56,6 +58,48 @@ eval-compare:
 
 lint:
 	agents-cli lint
+
+## GCP障害シナリオ(store-app / Cloud Run + Gemini Cloud Assist) ---------------
+# 対象プロジェクトは環境変数 SANDBOX_PROJECT_ID(未設定ならエラー)
+
+# デモ準備の一括実行: API有効化 → 正常デプロイ → 障害注入(FAIL_MODE=db_timeout)
+gcp-incident-create:
+	scripts/gcp_incident.sh create
+
+# サービスの環境変数と直近リクエストの結果を表示
+gcp-incident-status:
+	scripts/gcp_incident.sh status
+
+# 障害を復旧(インフラ運用チーム役: FAIL_MODE=none に戻す)
+gcp-incident-resolve:
+	scripts/gcp_incident.sh resolve
+
+# デモ環境の削除(Cloud Run サービスを削除)
+gcp-incident-clean:
+	scripts/gcp_incident.sh clean
+
+## GCEインフラ障害シナリオ(store-web-01/02/03 / e2-micro + Ops Agent → BigQuery) -----
+# 対象プロジェクトは環境変数 SANDBOX_PROJECT_ID(未設定ならエラー。store-appと共通)
+
+# デモ準備の一括実行: API有効化+ロール付与 → 3台デプロイ → store-web-02で障害注入
+gce-incident-create:
+	scripts/gce_incident.sh create
+
+# store-web-02 で障害を(再)注入する(resolve後にもう一度試す場合)
+gce-incident-break:
+	scripts/gce_incident.sh break
+
+# 3台のWeb応答とstore-web-02の障害プロセス・メモリ状態を表示
+gce-incident-status:
+	scripts/gce_incident.sh status
+
+# 障害を復旧(store-web-02を再起動。リーク解消、障害プロセスは自動再開しない)
+gce-incident-resolve:
+	scripts/gce_incident.sh resolve
+
+# デモ環境の削除(3台のインスタンスを削除。firewall/BigQuery/sinkは残す)
+gce-incident-clean:
+	scripts/gce_incident.sh clean
 
 ## デプロイ -------------------------------------------------------------------
 

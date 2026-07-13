@@ -26,3 +26,13 @@ def get_project_id() -> str:
             "GCPプロジェクトを特定できません。GOOGLE_CLOUD_PROJECT を設定してください。"
         )
     return project
+
+
+def get_sandbox_project_id() -> str | None:
+    """GCP障害シナリオの調査対象サンドボックスプロジェクトID。
+
+    環境変数 SANDBOX_PROJECT_ID から取得する(エージェント自身の実行プロジェクト
+    GOOGLE_CLOUD_PROJECT とは別物)。未設定なら None を返し、その場合
+    Gemini Cloud Assist の MCP ツールセットはエージェントに組み込まれない。
+    """
+    return os.environ.get("SANDBOX_PROJECT_ID") or None
