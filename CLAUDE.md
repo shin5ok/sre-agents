@@ -10,6 +10,7 @@ Key runtime facts:
 - Model: `gemini-3.5-flash` via Vertex AI (`GOOGLE_CLOUD_LOCATION=global` is bootstrapped in `app/agent.py`; the `gemini-flash-latest` alias does NOT exist in this project — don't revert to it).
 - Firestore: named database `sre-agents` in `asia-northeast1` (collections `support_cases`, `incident_logs`); seed data via `make seed`.
 - Remediation tools are deterministic mocks (`app/tools/remediation_tools.py` is the swap-point for real implementations).
+- **HITL gating**: `restart_server` and `escalate_to_engineer` check `tool_context.state["recovery_plan_proposed"]` and refuse execution unless `propose_recovery_plan` has been called first with a matching `action_type`. Instruction + defense-in-depth at the tool layer.
 
 ## What this project is
 
@@ -18,9 +19,9 @@ An SRE automation system for a company with sites nationwide (Japan) whose syste
 Two agents are planned (see `SPEC.md` for the full flow):
 
 - **Reception agent (受付エージェント)** — takes the incident report from the store, interviews the reporter until symptoms are sufficiently characterized, writes the case to a database, hands off to the investigation agent.
-- **Investigation agent (調査エージェント)** — investigates root cause, proposes a fix by consulting documentation and prior incident logs, either executes the fix or escalates, then records the resolution back to the log for future retrieval.
+- **Investigation agent (調査エージェント)** — investigates root cause, consults documentation and prior incident logs, then **presents a recovery plan (root cause / planned action / impact) via `propose_recovery_plan` and waits for the operator's approval (HITL)** before executing `restart_server` or `escalate_to_engineer`. Records the resolution back to the log for future retrieval.
 
-The two agents form a pipeline; the reception agent's DB write is the handoff signal.
+The two agents form a pipeline; the reception agent's DB write is the handoff signal. Recovery execution is gated by an HITL approval step — the operator's initial request may include an explicit pre-approval ("そのまま実施してください" 等) to auto-proceed after the plan is proposed.
 
 ## Tech stack (locked by SPEC)
 
@@ -34,7 +35,7 @@ The two agents form a pipeline; the reception agent's DB write is the handoff si
 
 - `SPEC.md` is authoritative for scope. When it and any later document disagree, resurface the conflict rather than silently choosing.
 - The spec is in Japanese; user-facing agent prompts and any generated Japanese content should stay in Japanese unless the user asks otherwise.
-- **Eval uses custom metrics only** (`tests/eval/eval_config.yaml`): the built-in `multi_turn_*` autoraters reject multi-agent traces ("Multiple agents detected"), so do not switch back to them while this app has two agents. Custom LLM-judge templates must not reference `{prompt}` (unavailable for `agent_data`-shaped traces).
+- **Eval uses custom metrics only** (`tests/eval/eval_config.yaml`): the built-in `multi_turn_*` autoraters reject multi-agent traces ("Multiple agents detected"), so do not switch back to them while this app has two agents. Custom LLM-judge templates currently use `{prompt}` because all eval cases are single-turn — if you introduce `agent_data`-continuation cases, drop `{prompt}` from the affected templates (it's not populated for those).
 - **agents-cli 0.5.1 `eval generate` does not replay `agent_data` continuation history to the agent** (prior turns end up in the trace but not in the model context). Author eval cases as single-turn prompts; use `agents-cli eval dataset synthesize` for true multi-turn coverage.
 - The `agents-cli run` SSE client disconnects after 120s without an event; the Gemini HTTP timeout in `app/sub_agents/__init__.py` (`build_model`) is set below that on purpose — keep it under 120s.
 

@@ -31,6 +31,7 @@ def test_investigation_tools_cover_spec_flow():
         "get_server_logs",
         "search_past_incidents",
         "search_runbooks",
+        "propose_recovery_plan",
         "restart_server",
         "escalate_to_engineer",
         "record_resolution_log",

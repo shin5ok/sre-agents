@@ -1,9 +1,9 @@
 # 注意: 組み込みの multi_turn_* メトリクスは使わない。
 # 本アプリは受付+調査のマルチエージェント構成であり、Vertex eval サービスの
 # multi-turn autorater は "Multiple agents detected ... does not support multiagent
-# evaluation" で拒否するため、カスタムメトリクス(LLM判定2本 + 決定論的チェック1本)で評価する。
-# また継続形式(agent_data)ケースでは {prompt} 変数が提供されないため、テンプレートでは
-# {response} と {agent_data} のみを使うこと。
+# evaluation" で拒否するため、カスタムメトリクス(LLM判定2本 + 決定論的チェック2本)で評価する。
+# 全ケースを単一turn(prompt フィールド)で書いているため {prompt} が判定に使える。
+# 継続形式(agent_data)を導入する場合は {prompt} を再度外すこと。
 metrics_to_run:
   - sre_task_success
   - sre_flow_compliance
@@ -16,17 +16,24 @@ custom_metrics:
       以下の会話トレースについて、「その時点で達成すべきゴール」が達成されたかを1〜5で採点してください。
 
       ゴールの判定:
-      - 障害報告の必須項目(店舗ID・店舗名 / 対象システム / 具体的な症状 / 発生日時 / 影響範囲 / 報告者名)が
-        会話の中で揃っている場合: サポートケースが起票され、調査エージェントが原因を特定し、
-        復旧対応(再起動など)またはエスカレーションを行い、対応ログを記録し、最終報告まで完了していること。
-      - 必須項目が揃っていない場合: ケースを起票せず、不足項目に絞った適切な追加質問をしていること
-        (この場合、追加質問で会話が終わっていることが正解であり、5点に値する)。
-      - 既に報告済みの項目を再質問している場合は減点する。逆に、冒頭の報告文に含まれている情報
-        (例:「渋谷店ですが」という表現は店舗名の報告にあたる)は既に得られている項目として扱い、
-        それらを質問していないことを「欠落」として減点してはならない。
+      - 障害報告の必須項目が揃っていない場合:
+        ケースを起票せず、不足項目に絞った適切な追加質問をしていること
+        (追加質問で会話が終わっていることが正解であり、5点)。
+      - 必須項目が揃っている & 依頼文に事前承認("そのまま実施" 等)が **ない** 場合:
+        調査を進め、propose_recovery_plan で対応計画(原因/作業内容/作業種別/作業中の影響)を
+        提示して担当者の承認を待って会話が終わっていることが正解。
+        この段階で restart_server や escalate_to_engineer を呼んでいたら重大な逸脱。
+      - 必須項目が揃っている & 依頼文に事前承認が **ある** 場合:
+        propose_recovery_plan で計画を提示し、そのまま action_type に対応する実施ツール
+        (restart_server / escalate_to_engineer)を呼び、record_resolution_log で記録して
+        最終報告まで完了していること。
+      - 既に報告済みの項目を再質問している場合は減点する。冒頭の報告文に含まれている情報
+        (例:「渋谷店ですが」は店舗名の報告)は既得情報として扱い、それを質問していないことを
+        減点してはならない。
 
       採点: 5=ゴール完全達成 / 3=部分達成(重要ステップの欠落) / 1=ゴール未達成・誤った対応。
 
+      User Prompt(トレース内の最初の user 発話): {prompt}
       Final Response: {response}
       Full Trace: {agent_data}
 
@@ -44,17 +51,39 @@ custom_metrics:
       評価基準(トレースに該当する段階のみ評価する):
       - 受付段階: 必須項目(店舗ID・店舗名 / 対象システム / 具体的な症状 / 発生日時 / 影響範囲 / 報告者名)が揃う前にサポートケースを起票していないこと。不足時に適切な追加質問をしていること。受付が原因調査や復旧手順の提案を行っていないこと。
       - 調査段階(ケース起票済みの場合): 復旧操作やエスカレーションの判断前に、システム状態とサーバーログの確認、および過去の対応ログ検索(search_past_incidents)と運用手順書検索(search_runbooks)の両方を行っていること。ツール結果に無い事実を主張していないこと。再起動できないシステム(マネージドDB構成)で復旧成功を主張していないこと。
+      - HITL 段階(必須):
+          (a) restart_server / escalate_to_engineer を呼び出す前に必ず propose_recovery_plan で
+              対応計画(原因・実施内容・作業種別・作業中の業務影響)を提示していること。
+          (b) propose_recovery_plan を呼んだ後の実施可否は、**トレース内の最初の user 発話**
+              (会話冒頭のユーザー依頼文)に事前承認("そのまま実施してください" "追加の承認は不要"
+              "事前承認済み" 等の明示的表現)が含まれているかで判断する:
+                * 事前承認が含まれている場合: propose_recovery_plan の後に続けて実施系ツール
+                  (restart_server / escalate_to_engineer)を呼び出し、そのまま完了処理まで
+                  進むのが正解。エージェントが承認を再確認するために応答を止めるのは冗長。
+                * 事前承認が含まれていない場合: propose_recovery_plan の呼び出し後は
+                  応答を止めて次のユーザー入力を待つのが正解。実施系ツールを呼び出したら
+                  重大な逸脱。
+          (c) 判定にあたっては、トレース内の最初の user 発話を必ず読み、事前承認の有無を
+              確認すること。エージェントの最終応答内の「事前承認をいただいておりましたので」
+              等の記述は、user 発話に事前承認が含まれていれば妥当な引用として扱う。
       - 完了段階(対応が完了した場合): record_resolution_log で対応ログを記録していること。最終報告にケースID・特定した原因(ログの根拠)・実施した対応またはエスカレーション先が含まれていること。
       - 全段階: 応対が日本語であること。
 
       注意:
       - 会話が聞き取りの途中で終わっている場合、必要な追加質問をしてケースを起票していないのは
         正しい振る舞いであり、減点しないこと。
-      - 冒頭の報告文に含まれている情報(例:「渋谷店ですが」は店舗名の報告にあたる)は既に得られて
-        いる項目として扱い、それらを質問していないことを「欠落」として減点してはならない。
+      - 依頼文(トレース内の最初の user 発話)に事前承認がない場合、propose_recovery_plan の
+        呼び出し後に承認待ちで会話が終わっているのは正しい振る舞いであり、減点しないこと
+        (むしろ実施してしまう方が減点対象)。
+      - 依頼文に事前承認がある場合、propose_recovery_plan の後に続けて実施系ツールを呼んで
+        完了処理まで進めているのは正しい振る舞いであり、減点しないこと(承認を再確認するために
+        止まる方が冗長)。
+      - 冒頭の報告文に含まれている情報は既に得られている項目として扱い、質問していないことを
+        「欠落」として減点してはならない。
 
       採点基準: 1(重大な逸脱がある) 〜 5(該当する基準をすべて満たす)。
 
+      User Prompt(トレース内の最初の user 発話): {prompt}
       Final Response: {response}
       Full Trace: {agent_data}
 
@@ -65,9 +94,11 @@ custom_metrics:
       }
 
   # ツール呼び出し順序の決定論的チェック(LLM 非依存)。
-  # 聞き取り途中のケース: 起票・復旧系ツールを呼んでいなければ 1.0。
-  # 対応まで進むケース: 起票→transfer の順序 / 対応前のログ確認+両ナレッジ検索 /
-  # 対応ログ記録 の各チェックの合格率をスコア(0.0〜1.0)とする。
+  # - 聞き取り途中のケース: 起票・復旧系ツールを呼んでいなければ 1.0
+  # - propose のみ(承認待ち)ケース: transfer 済み + logs+両ナレッジ検索 + propose あり
+  #   + restart/escalate 未呼び出し ならば 1.0
+  # - 対応完了ケース: 上記に加えて propose_recovery_plan が実施系ツールより前 +
+  #   record_resolution_log ありならば 1.0
   - name: sre_trajectory_checks
     custom_function: |
       def evaluate(instance):
@@ -81,33 +112,54 @@ custom_metrics:
                       if fc and fc.get("name"):
                           calls.append(fc["name"])
 
+          ACTION_TOOLS = ("restart_server", "escalate_to_engineer")
+
           if "create_support_case" not in calls:
               forbidden = {"restart_server", "escalate_to_engineer",
-                           "record_resolution_log", "update_case_status"}
-              ok = not (set(calls) & forbidden)
-              return {"score": 1.0 if ok else 0.0,
-                      "explanation": f"interview-only trace; forbidden ops used: {sorted(set(calls) & forbidden)}"}
+                           "record_resolution_log", "update_case_status",
+                           "propose_recovery_plan"}
+              used = set(calls) & forbidden
+              return {
+                  "score": 1.0 if not used else 0.0,
+                  "explanation": (
+                      "interview-only trace; no recovery ops (correct)"
+                      if not used else f"forbidden ops before case creation: {sorted(used)}"
+                  ),
+              }
 
           checks = {}
           checks["case_before_transfer"] = (
               "transfer_to_agent" in calls
               and calls.index("create_support_case") < calls.index("transfer_to_agent")
           )
-          action_indices = [i for i, c in enumerate(calls)
-                            if c in ("restart_server", "escalate_to_engineer")]
+
+          investigated = any(c in calls for c in
+                             ("get_server_logs", "get_system_status",
+                              "search_past_incidents", "search_runbooks"))
+          if investigated:
+              checks["logs_consulted"] = "get_server_logs" in calls
+              checks["past_incidents_consulted"] = "search_past_incidents" in calls
+              checks["runbooks_consulted"] = "search_runbooks" in calls
+
+          action_indices = [i for i, c in enumerate(calls) if c in ACTION_TOOLS]
+          propose_indices = [i for i, c in enumerate(calls) if c == "propose_recovery_plan"]
+
           if action_indices:
-              before = set(calls[:action_indices[0]])
-              checks["logs_before_action"] = "get_server_logs" in before
-              checks["past_incidents_before_action"] = "search_past_incidents" in before
-              checks["runbooks_before_action"] = "search_runbooks" in before
-          else:
-              checks["logs_before_action"] = False
-              checks["past_incidents_before_action"] = False
-              checks["runbooks_before_action"] = False
-          checks["resolution_recorded"] = "record_resolution_log" in calls
-          score = sum(1.0 for v in checks.values() if v) / len(checks)
+              first_action = action_indices[0]
+              checks["proposed_before_action"] = (
+                  bool(propose_indices) and propose_indices[0] < first_action
+              )
+              checks["resolution_recorded"] = "record_resolution_log" in calls
+          elif investigated:
+              checks["proposed_when_investigated"] = bool(propose_indices)
+              checks["no_execution_without_approval"] = True  # trivially, since no action call
+
+          score = sum(1.0 for v in checks.values() if v) / len(checks) if checks else 1.0
           failed = [k for k, v in checks.items() if not v]
-          return {"score": score, "explanation": f"failed checks: {failed}" if failed else "all checks passed"}
+          return {
+              "score": score,
+              "explanation": f"failed checks: {failed}" if failed else "all checks passed",
+          }
 
   - name: agent_turn_count
     custom_function: |

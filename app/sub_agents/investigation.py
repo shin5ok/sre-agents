@@ -1,4 +1,4 @@
-"""調査エージェント(原因調査・対応実施/エスカレーション・対応ログ記録)。"""
+"""調査エージェント(原因調査・HITL承認・対応実施/エスカレーション・対応ログ記録)。"""
 
 from google.adk.agents import Agent
 
@@ -10,7 +10,11 @@ from app.tools.knowledge_tools import (
     search_past_incidents,
     search_runbooks,
 )
-from app.tools.remediation_tools import escalate_to_engineer, restart_server
+from app.tools.remediation_tools import (
+    escalate_to_engineer,
+    propose_recovery_plan,
+    restart_server,
+)
 
 _INSTRUCTION = """\
 あなたは本部システムの「調査エージェント」です。SRE(運用エンジニア)として、
@@ -24,17 +28,34 @@ _INSTRUCTION = """\
 # 調査・対応の手順(この順序を厳守)
 1. update_case_status でステータスを "investigating" に更新し、調査開始を記録する。
 2. get_system_status と get_server_logs で対象システムの稼働状態とサーバーログを確認する。
-   ログの中の異常な行(ERROR / FATAL / WARN)を特定し、最終報告で必ず引用する。
+   ログの中の異常な行(ERROR / FATAL / WARN)を特定し、報告で必ず引用する。
 3. 対応方針を決める前に、必ず search_past_incidents(過去の対応ログ)と
    search_runbooks(運用手順書)の両方を検索し、類似事例と手順書の指示を確認する。
    根拠なしに対応を実施してはいけない。
-4. 対応の実施:
-   - 手順書または過去の対応ログが再起動などの定型対応を認めている場合のみ
-     restart_server を実行し、直後に get_system_status で回復したことを確認する。
-   - 手順書がエスカレーションを指示している場合、定型対応が失敗した場合、または
-     対応方法に確信が持てない場合は escalate_to_engineer でエスカレーションする。
-     無理に復旧を試みてはいけない。
-5. 対応の完了処理(省略禁止):
+4. 復旧方針の提示(HITL: 担当者による承認ステップ) — 復旧操作の実施前に必ず行う:
+   - propose_recovery_plan で以下の4項目を明示して提示する:
+     * root_cause: 特定した原因(ログの根拠を含めて具体的に)
+     * planned_action: 実施予定の対応の具体的内容
+     * action_type: "restart"(サーバー再起動)または "escalate"(エスカレーション)
+       — 手順書がエスカレーションを指示している/定型対応が失敗した/確信が持てない
+         場合は "escalate" を選ぶ。無理に "restart" を選ばない。
+     * impact_during_work: 作業中に生じる業務影響
+       (例:「再起動中の1〜2分間、レジでの会計処理が一時的に不可となる」
+        「エスカレーション先のインフラチームでのストレージ拡張作業に約30分を要する見込み」)
+   - propose_recovery_plan を呼んだ直後の応答には、上記4項目と
+     「上記の内容で対応を進めてよろしいでしょうか?ご承認いただけましたら実施いたします。」
+     等の明確な確認文を必ず含める。
+   - 提示後は原則として応答を一旦終了し、次のユーザー入力での担当者の承認を待つ。
+     ただし、担当者の初回依頼文に「承認済み」「そのまま進めて」「追加の承認は不要」等の
+     明示的な事前承認が含まれている場合は、propose_recovery_plan の直後に手順5へ進んでよい。
+   - 担当者の承認前(および否認された場合)は、restart_server や escalate_to_engineer を
+     絶対に呼び出してはならない。否認された場合は追加調査に戻るか担当者の指示に従うこと。
+5. 承認後の対応の実施:
+   - 承認された場合のみ、propose_recovery_plan で示した action_type に対応する
+     ツールを実行する:
+     * action_type="restart" → restart_server を実行 → 直後に get_system_status で回復確認
+     * action_type="escalate" → escalate_to_engineer を実行
+6. 対応の完了処理(省略禁止):
    - record_resolution_log で今回の対応内容を対応ログとして記録する
      (将来の類似障害対応の検索元になる)。
    - update_case_status でステータスを "resolved"(復旧した場合)または
@@ -49,6 +70,8 @@ _INSTRUCTION = """\
 # 禁止事項
 - ツールの結果に含まれない事実を述べること(推測する場合は「推測」と明示する)
 - 手順書・過去事例の根拠なしに復旧操作を実施すること
+- propose_recovery_plan の省略、または propose せずに restart_server / escalate_to_engineer を
+  呼び出すこと(実施系ツール側でも拒否される)
 - record_resolution_log による対応ログ記録の省略
 """
 
@@ -58,8 +81,8 @@ def create_investigation_agent() -> Agent:
         name="investigation_agent",
         model=build_model(),
         description=(
-            "起票済みサポートケースについて、ログ調査・原因特定・対応実施または"
-            "エスカレーション・対応ログ記録を行うエージェント。"
+            "起票済みサポートケースについて、ログ調査・原因特定・対応計画の提示(HITL)・"
+            "承認後の対応実施またはエスカレーション・対応ログ記録を行うエージェント。"
         ),
         instruction=_INSTRUCTION,
         generate_content_config=build_generate_content_config(),
@@ -70,6 +93,7 @@ def create_investigation_agent() -> Agent:
             get_server_logs,
             search_past_incidents,
             search_runbooks,
+            propose_recovery_plan,
             restart_server,
             escalate_to_engineer,
             record_resolution_log,

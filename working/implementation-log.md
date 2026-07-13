@@ -1,8 +1,8 @@
 # SRE障害対応エージェント 実装作業ログ
 
 **プロジェクト**: 本部システム(GCP)の障害対応を自動化するAIエージェント
-**期間**: 2026-07-09(1セッション)
-**成果**: Eval 3ケース満点 / ユニットテスト17件パス / lint全チェック通過
+**期間**: 2026-07-09(初回)、2026-07-13(HITL追加)
+**成果**: Eval 4ケース満点 / ユニットテスト25件パス / lint全チェック通過
 
 ---
 
@@ -16,6 +16,7 @@
 6. [遭遇した問題と解決策](#6-遭遇した問題と解決策)
 7. [評価結果](#7-評価結果)
 8. [今後の作業](#8-今後の作業)
+9. [追加機能: HITL(復旧実施前の承認ステップ)](#9-追加機能-hitl復旧実施前の承認ステップ)
 
 ---
 
@@ -367,3 +368,94 @@ agents-cli lint            : ruff / format / codespell / ty すべてパス
 3. **agents-cli run の SSE は120秒無通信でタイムアウト** — Gemini モデルのHTTPタイムアウトを 60秒に設定
 4. **Firestore の (default) DB はリージョン変更不可** — 別リージョンで運用するなら named DB を新規作成
 5. **google-agents-cli 1.0.0 がPyPIにあるが skills は 0.5.0** — `~=0.5.0` にピン
+6. **eval の LLM judge テンプレートは `{prompt}` を含めないと user の初回発話を見ない** — trace の agent_data だけでは初回 user 発話が判定に使えないため、単一turnケースでは `{prompt}` を明示的に含める
+
+---
+
+## 9. 追加機能: HITL(復旧実施前の承認ステップ)
+
+### 動機
+実運用では、SRE エージェントが独断で `restart_server` や `escalate_to_engineer` を
+実行するのはリスクが大きい(業務影響のあるオペレーション)。担当者が「原因・作業内容・
+作業中の影響」を確認してから承認する Human-in-the-Loop ステップを間に挟むよう変更。
+
+### 実装
+
+**1. 新ツール `propose_recovery_plan`** (`app/tools/remediation_tools.py`)
+- 引数: `case_id, root_cause, planned_action, action_type("restart"|"escalate"), impact_during_work`
+- 副作用: `tool_context.state["recovery_plan_proposed"] = action_type` をセット
+- 返却: `{"status": "awaiting_approval", "plan": {...}, "message": "...承認してから実施ツールを呼んでください"}`
+- 実際の復旧操作は行わない(計画の登録・提示のみ)
+
+**2. 実施系ツールに防御深化のゲート追加**
+- `restart_server` / `escalate_to_engineer` は state の `recovery_plan_proposed` を確認
+- 未セット or action_type 不一致なら status=error を返却して実行拒否
+- LLM が指示を無視しても実際の操作は走らない設計
+- `escalate_to_engineer` に `tool_context` 引数を追加(シグネチャ変更)
+
+**3. Instruction 更新** (`app/sub_agents/investigation.py`)
+- 手順4「復旧方針の提示(HITL)」を明示 — propose_recovery_plan の呼び出し必須、
+  呼び出し後は原則応答を止めて次入力での承認を待つ
+- 例外: 初回依頼文に「そのまま実施」「事前承認済み」等の明示的事前承認があれば
+  そのまま実施へ進んでよい(運用上の柔軟性)
+- 承認前の実施系ツール呼び出しは禁止事項として明記
+
+**4. eval を4ケースに再設計** (`tests/eval/datasets/basic-dataset.json`)
+- `intake_interview_incomplete`: 情報不足 → 追加質問(既存)
+- `propose_awaits_approval`: 完全報告(事前承認なし) → propose して承認待ちで停止
+- `pre_approved_resolution`: 完全報告(事前承認あり)+ sales-mgmt → propose→restart→完了
+- `pre_approved_escalation`: 完全報告(事前承認あり)+ order-mgmt → propose→escalate→完了
+
+**5. 決定論的軌跡チェック更新** (`sre_trajectory_checks`)
+- action(restart/escalate)が呼ばれた場合、その前に propose_recovery_plan があること
+- action が呼ばれず投稿だけの場合、propose_recovery_plan は呼ばれていること
+- 承認前の実施系呼び出しは無し
+
+**6. HITL 動作の追加ユニットテスト** (`tests/unit/test_hitl_gating.py` — 8件)
+- propose なしでの restart/escalate は error
+- action_type 不一致(restart 計画で escalate 実施等)は error
+- propose 済みなら実行成功
+- 再起動不可システムは承認があっても実行不可(実世界制約)
+
+### 遭遇した問題
+
+**問題A: judge が「事前承認」を認識せず、trajectory は満点なのに flow_compliance が 1〜2点**
+- 原因: LLM judge の template が `{response}` と `{agent_data}` しか渡していなかった。
+  trace の `agent_data` には agent の tool call/text のみが入り、user の初回発話は含まれない。
+  結果、judge は「trace のどこにも user の "承認" 表現がない」と判断して減点していた。
+- 対処: template に `{prompt}` を追加(単一turnケースでは populate される)。CLAUDE.md にも
+  「単一turnなら {prompt} 使ってよい」と記録した。
+
+**問題B: `agents-cli eval grade` は artifacts/traces/ 内の全ファイルを対象にする**
+- 症状: 新規4ケースを grade したはずが19件評価されていた
+- 対処: 古い trace ファイル(pre-HITL のもの5個)を `rm` してから再 grade
+- 教訓: 大きな仕様変更後は `artifacts/traces/` を一度掃除するのが安全
+
+### 最終スコア(HITL適用後)
+
+| ケース | task_success | flow_compliance | trajectory_checks |
+|---|---|---|---|
+| intake_interview_incomplete | 5.0 | 5.0 | 1.0 |
+| propose_awaits_approval | 5.0 | 5.0 | 1.0 |
+| pre_approved_resolution | 5.0 | 5.0 | 1.0 |
+| pre_approved_escalation | 5.0 | 5.0 | 1.0 |
+| **平均** | **5.0** | **5.0** | **1.0** |
+
+### HITL スモークテスト実績(ADK Runner 直叩き)
+
+**Case A(事前承認なし)** — 9 tool calls、27秒:
+```
+reception: list_managed_systems → create_support_case → transfer_to_agent
+investigation: update_case_status → get_system_status → get_server_logs
+             → search_past_incidents → search_runbooks → propose_recovery_plan → STOP
+```
+最終応答に原因・作業内容・作業中影響・「進めてよろしいでしょうか?」の確認文が含まれる。
+`restart_server` / `escalate_to_engineer` は呼ばれない。
+
+**Case B(事前承認あり)** — 13 tool calls、41秒:
+```
+... (Case A と同じ流れ) ... → propose_recovery_plan
+             → restart_server → get_system_status(healthy確認)
+             → record_resolution_log → update_case_status("resolved")
+```
+propose の後に続けて実施系ツールを呼び、対応ログ記録まで完了。
