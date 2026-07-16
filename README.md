@@ -16,7 +16,8 @@ Google ADK 2.x / Python / Vertex AI(Gemini)/ Firestore で構築。
 
 - **受付エージェント(reception_agent)** — 店舗からの障害報告を日本語で聞き取り、
   必須項目(店舗ID・店舗名 / 対象システム / 症状 / 発生日時 / 影響範囲 / 報告者名)が
-  揃ったら Firestore にサポートケースを起票し、調査エージェントへ引き継ぐ
+  揃ったら**起票内容を報告者に提示して確認を取り(起票前レビュー)**、確認後に
+  Firestore にサポートケースを起票し、調査エージェントへ引き継ぐ
 - **調査エージェント(investigation_agent)** — サーバー状態・ログ確認、
   過去対応ログ検索 + 運用手順書検索を経て**復旧計画を提示 → 承認待ち(HITL)**、
   承認後に復旧(モック)またはエスカレーションを実行、対応ログを Firestore に記録
@@ -26,7 +27,12 @@ Google ADK 2.x / Python / Vertex AI(Gemini)/ Firestore で構築。
 ```
 User(店舗) ── report ──► reception_agent (root)
                              │
-                             ▼ 必須6項目が揃ったら
+                             ▼ ★ 起票前レビュー(必須6項目が揃ったら)
+                       propose_case_draft
+                          {店舗 / システム / 症状 / 発生日時 / 影響範囲 / 報告者}
+                             │
+                             ▼ ── 報告者の確認 ──►(未確認なら停止)
+                             │
                        create_support_case ──► Firestore(support_cases)
                              │
                              ▼ transfer_to_agent
@@ -47,28 +53,33 @@ User(店舗) ── report ──► reception_agent (root)
                              └─ update_case_status("resolved" or "escalated")
 ```
 
-**HITL の要点**: `restart_server` / `escalate_to_engineer` は
-`propose_recovery_plan` で承認情報が state にセットされていないと
-ツール側でエラー返却(**指示層 + ツール層の二重ゲート**)。
-初回依頼文に「そのまま実施してください」等の**明示的な事前承認**があれば
-propose 直後に連続実行する運用も可能。
+**HITL の要点(二重ゲートは2箇所)**:
+`create_support_case` は `propose_case_draft`(起票前レビュー)を、
+`restart_server` / `escalate_to_engineer` は `propose_recovery_plan` を
+通していないとツール側でエラー返却(**指示層 + ツール層の二重ゲート**)。
+初回依頼文に「以上の内容で対応をお願いします」「そのまま実施してください」等の
+**明示的な続行指示・事前承認**があれば、提示直後に連続実行する運用も可能。
 
 ## デモシナリオ
 
 | system_id | 表示名 | ログ異常 | 期待される対応 |
 |---|---|---|---|
 | `sales-mgmt` | 売上管理システム | DB接続プール枯渇(HikariPool timeout) | 再起動で復旧 |
-| `inventory-mgmt` | 在庫管理システム | OutOfMemoryError + Full GC 連発 | 再起動で復旧 |
+| `inventory-mgmt` | 在庫管理システム | OutOfMemoryError + Full GC 連発 | 再起動で復旧(`SANDBOX_PROJECT_ID` 設定時は **GCE実リセット**) |
 | `order-mgmt` | 発注管理システム | `No space left on device`(DBストレージ枯渇) | 再起動不可 → **エスカレーション** |
 | `store-app` | 店舗アプリAPI | 外形監視で HTTP 500 多発(詳細はGCP側) | **Cloud Assist で GCP 層を調査** → エスカレーション |
+| `store-web-fleet` | 店舗Webサーバー群 | 監視: store-web-02 のメモリ急上昇+503(実因はOOM) | **BigQuery実ログで調査** → 再起動(**実リセット**) |
 
-各システムのログ 8〜12 行、過去対応ログ 6 件、運用手順書 6 本を用意していて、
+各システムのログ 8〜12 行、過去対応ログ 7 件、運用手順書 7 本を用意していて、
 LLM は「ログの異常 → 過去事例 → 手順書」の 3 点が同じ結論を指すのを確認しながら判断する。
 
-`store-app` だけは**実GCP環境と接続する例**: モックのログは外形監視の抜粋のみで、
-真の原因(Cloud Run の環境変数設定不備によるDB接続タイムアウト)は
-**Gemini Cloud Assist のリモート MCP サーバー**経由でしか特定できない
+`store-app` と `store-web-fleet` は**実GCP環境と接続する例**: モックのログは
+外形監視・監視サマリーの抜粋のみで、真の原因は GCP 側の実データ
+(Cloud Assist の調査 / BigQuery のカーネルログ)でしか特定できない
 (後述の「GCP障害シナリオ」参照)。
+`inventory-mgmt` は逆パターンで、調査はモックログで完結し、
+**復旧(restart_server)だけが実GCPに反映される**
+(GCE インスタンス `inventory-mgmt` を実リセット。後述のシナリオ3)。
 
 ---
 
@@ -81,12 +92,12 @@ LLM は「ログの異常 → 過去事例 → 手順書」の 3 点が同じ結
 ```bash
 make install     # agents-cli~=0.5.0 を tool install + uv sync(dev/eval/lint 全部)
 make db-create   # Firestore named DB "sre-agents"(asia-northeast1)を作成 [初回のみ]
-make seed        # 過去対応ログ 5 件を投入(冪等)
+make seed        # 過去対応ログ 7 件を投入(冪等)
 ```
 
 GCP プロジェクトは環境変数 `GOOGLE_CLOUD_PROJECT` で指定。未設定なら ADC から自動解決。
 Firestore の named database 名は `FIRESTORE_DATABASE`(既定: `sre-agents`)。
-GCP障害シナリオ(store-app)を使う場合のみ `SANDBOX_PROJECT_ID` を設定する(後述)。
+GCP障害シナリオ(store-app / store-web-fleet)を使う場合のみ `SANDBOX_PROJECT_ID` を設定する(後述)。
 参考は [`.env.example`](./.env.example)。
 
 ---
@@ -97,29 +108,46 @@ GCP障害シナリオ(store-app)を使う場合のみ `SANDBOX_PROJECT_ID` を�
 |---|---|
 | `make install` | 依存一式のインストール(agents-cli ~=0.5.0 + uv sync) |
 | `make db-create` | Firestore named DB `sre-agents` を asia-northeast1 に作成(初回のみ) |
-| `make seed` | 過去対応ログ 6 件を投入(冪等) |
+| `make seed` | 過去対応ログ 7 件を投入(冪等) |
 | `make run` | ワンショット実行(`PROMPT="..."` で上書き可能) |
 | `make chat` | サーバー起動+ワンショット。続きは `agents-cli run --session-id <ID> "..."` |
+| `make welcome` | ウェルカム画面の確認(受付が「SRE エージェントへようこそ」を返す) |
 | `make playground` | `adk web` の対話 UI(ブラウザで動作確認) |
-| `make test` | ユニットテスト(LLM 非依存、29 件) |
-| `make eval` | `agents-cli eval run`(generate + grade、4 ケース) |
+| `make test` | ユニットテスト(LLM 非依存、45 件) |
+| `make eval` | `agents-cli eval run`(generate + grade、5 ケース) |
 | `make eval-compare BASE=... CAND=...` | 2 つの grade 結果の回帰比較 |
 | `make lint` | ruff / format / codespell / ty のチェック |
-| `make gcp-incident-create` | GCP障害シナリオ準備(API有効化+デプロイ+障害注入)※要 `SANDBOX_PROJECT_ID` |
+| `make gcp-incident-create` | GCP障害シナリオ1準備(Cloud Run: API有効化+デプロイ+障害注入)※要 `SANDBOX_PROJECT_ID` |
 | `make gcp-incident-status` | store-app の環境変数と直近リクエスト結果を表示 |
-| `make gcp-incident-resolve` | GCP障害を復旧(`FAIL_MODE=none` に戻す) |
+| `make gcp-incident-resolve` | GCP障害1を復旧(`FAIL_MODE=none` に戻す) |
 | `make gcp-incident-clean` | store-app サービスを削除 |
-| `make gce-incident-create` | GCEインフラ障害シナリオ準備(3台デプロイ+障害注入)※要 `SANDBOX_PROJECT_ID` |
-| `make gce-incident-break` | store-web-02 で障害を(再)注入 |
-| `make gce-incident-status` | 3台のWeb応答とstore-web-02の障害プロセス・メモリ状態を表示 |
-| `make gce-incident-resolve` | store-web-02 を再起動して復旧 |
-| `make gce-incident-clean` | 3台のインスタンスを削除 |
+| `make gce-incident-create` | GCP障害シナリオ2準備(GCE 3台+BigQueryエクスポート+障害注入)※要 `SANDBOX_PROJECT_ID` |
+| `make gce-incident-break` | store-web-02 に障害を再注入(resolve 後にもう一度試す場合) |
+| `make gce-incident-status` | 3台のWeb応答と store-web-02 の障害プロセス/メモリ状態 |
+| `make gce-incident-resolve` | store-web-02 を再起動して復旧(エージェントの restart_server と同等) |
+| `make gce-incident-clean` | GCEインスタンス3台を削除 |
+| `make inventory-incident-create` | 在庫管理APサーバー役の GCE `inventory-mgmt` を作成(restart_server の実リセット対象)※要 `SANDBOX_PROJECT_ID` |
+| `make inventory-incident-status` | inventory-mgmt の稼働状態と直近の操作履歴(reset の実行記録)を表示 |
+| `make inventory-incident-resolve` | inventory-mgmt を手動リセット(エージェントの restart_server と同等) |
+| `make inventory-incident-clean` | inventory-mgmt インスタンスを削除 |
 | `make deploy-setup` | prototype に Agent Runtime 設定を追加(初回のみ) |
 | `make deploy` | Agent Runtime へのデプロイ(**要・人間の明示的承認**) |
 
 ---
 
-## 動かしてみる(3つの経路)
+## 動かしてみる(5つの経路)
+
+### 0. ウェルカム画面(挨拶だけの初回入力)
+
+```bash
+make welcome
+# または
+make run PROMPT="こんにちは"
+```
+
+→ 受付エージェントが「**SRE エージェントへようこそ**」の案内(担当役割 +
+   障害報告に必要な6項目)を返して停止する。ケース起票はしない。
+   `adk web`(`make playground`)で最初に "こんにちは" と送っても同じ画面が出る。
 
 ### 1. 情報不足の報告 → 追加質問
 
@@ -130,31 +158,47 @@ make run PROMPT="渋谷店ですが、売上管理システムの調子が悪く
 → 受付が不足項目(店舗ID/発生日時/影響範囲/報告者名 等)を番号付きで質問して終わる。
    ケース起票はしない。
 
-### 2. 完全報告(承認待ち経路)
+### 2. 完全報告(起票前レビューで停止)
 
 ```bash
-make run PROMPT="渋谷店(店舗ID:1102)の佐藤です。売上管理システムで今朝9時ごろからレジの会計時に「売上データの送信がタイムアウトしました」というエラーが出ます。店内のレジ2台すべてで発生していて、他の業務は正常です。原因を調査して対応方針を提案してください。復旧作業の実施は私の承認を得てから進めてください。"
+make run PROMPT="池袋店(店舗ID:2205)の田中です。在庫管理システムで今朝7時半ごろから在庫照会に30秒近くかかり、断続的にエラーも出ています。店内の発注端末2台で発生していて、棚卸作業が止まっています。"
 ```
 
-→ 受付が起票 → 調査が調査 → **propose_recovery_plan で計画提示 → 停止して承認待ち**。
-   `restart_server` は呼ばれない。
+→ 必須項目は揃っているが続行指示がないため、受付が **propose_case_draft で
+   起票内容を提示して停止(報告者の確認待ち)**。起票・調査はまだ行わない。
+   続きは同セッションで確認を返す:
+   `agents-cli run "はい、その内容でお願いします。" --session-id <表示されたID>`
+   → 起票 → 調査 → propose_recovery_plan 提示 → 承認待ち、と多段HITLで進む。
 
-### 3. 完全報告 + 事前承認(フル自走)
+### 3. 完全報告 + 続行指示(承認待ち経路)
+
+```bash
+make run PROMPT="渋谷店(店舗ID:1102)の佐藤です。売上管理システムで今朝9時ごろからレジの会計時に「売上データの送信がタイムアウトしました」というエラーが出ます。店内のレジ2台すべてで発生していて、他の業務は正常です。報告内容は以上の通りで間違いありませんので、このまま起票して原因の調査と対応方針の提案を進めてください。復旧作業の実施は私の承認を得てから進めてください。"
+```
+
+→ 受付が内容を提示しつつ**続行指示ありと判断して同一応答内で起票** → 調査 →
+   **propose_recovery_plan で計画提示 → 停止して承認待ち**。`restart_server` は呼ばれない。
+
+### 4. 完全報告 + 事前承認(フル自走)
 
 ```bash
 make run PROMPT="渋谷店(店舗ID:1102)の佐藤です。売上管理システムで今朝9時ごろからレジの会計時に「売上データの送信がタイムアウトしました」というエラーが出ます。店内のレジ2台すべてで発生していて、他の業務は正常です。原因を特定し対応計画を提示した上で、そのまま復旧作業まで実施してください。追加の承認は不要です(事前承認済み)。"
 ```
 
-→ 起票 → 調査 → propose → **承認済みとみなして** restart_server → 稼働確認 →
+→ 内容提示 → 起票 → 調査 → propose → **承認済みとみなして** restart_server → 稼働確認 →
    record_resolution_log → status を resolved に更新まで自走(所要 30〜40 秒)。
 
 対話 UI から触りたい場合は `make playground`(ブラウザで開く)。
 
 ---
 
-## GCP障害シナリオ(Gemini Cloud Assist 連携)
+## GCP障害シナリオ(実GCP環境との接続)
 
-モック3システムに加えて、**実際のGCP障害**を調査させる例が `store-app`(Cloud Run)。
+モックに加えて、**実際のGCP障害**を調査・復旧させる例が2つある。
+シナリオの ground truth・証跡の場所は [`working/demo-scenarios.md`](./working/demo-scenarios.md) 参照。
+
+### シナリオ1: `store-app`(Cloud Run / アプリ層)
+
 調査エージェントに [Gemini Cloud Assist のリモート MCP サーバー](https://docs.cloud.google.com/cloud-assist/use-gemini-cloud-assist-mcp)
 (`https://geminicloudassist.googleapis.com/mcp`)がツールセットとして組み込まれ、
 `investigate_issue` / `ask_cloud_assist` で GCP 側の実ログ・構成を調査する。
@@ -168,11 +212,52 @@ investigation_agent
    └─ propose_recovery_plan(HITL) → 承認 → escalate_to_engineer
 ```
 
+### シナリオ2: `store-web-fleet`(GCE / インフラ層・メモリリーク→OOM)
+
+実体は Compute Engine 3台(store-web-01/02/03)。store-web-02 に障害を注入すると
+メモリリークが進行し、約8〜10分後にカーネルの OOM Killer がプロセスを強制終了。
+その実ログが Cloud Logging → BigQuery(`sre_agents_demo_logs.syslog`)へ
+エクスポートされ、調査エージェントは `query_incident_bigquery_logs` で検索する。
+
+```
+investigation_agent
+   ├─ get_system_status("store-web-fleet") → 監視: store-web-02 メモリ95% + 503
+   ├─ query_incident_bigquery_logs("Out of memory")          ← BigQuery 実ログ
+   │      → カーネルの「Out of memory: Killed process (python3)」を発見
+   ├─ search_past_incidents / search_runbooks → 「再起動で復旧」の根拠
+   └─ propose_recovery_plan(HITL) → 承認 → restart_server
+                                        └─ ★ Compute Engine API で store-web-02 を実リセット
+```
+
+**restart_server は実際のインスタンスリセットを行う**
+(`app/tools/remediation_tools.py` の差し替えポイントの実装例)。
+エージェント承認後の復旧が実VMに反映されるため、`make gce-incident-resolve` を
+人手で実行する必要はない(HITL 承認は従来どおり必須)。
+
+### シナリオ3: `inventory-mgmt`(GCE / 調査はモック・復旧のみ実GCP)
+
+在庫管理システムの障害(Java heap OOM)は従来どおりモックログ・過去事例・手順書で
+調査が完結するが、restart_server は GCE インスタンス `inventory-mgmt` を
+**実際にリセット**する(store-web-fleet と同じ差し替え実装。HITL 承認は必須)。
+「調査は社内データで完結し、復旧操作だけが実環境に反映される」構成の例で、
+障害注入や BigQuery エクスポートは使わない。
+
+```
+investigation_agent
+   ├─ get_system_status / get_server_logs("inventory-mgmt")
+   │      → OutOfMemoryError: Java heap space + Full GC 連発(モックログ)
+   ├─ search_past_incidents(INC-2025-0002)/ search_runbooks(inventory-mgmt.md)
+   │      → 「APサーバー(インスタンス inventory-mgmt)の再起動で復旧」の根拠
+   └─ propose_recovery_plan(HITL) → 承認 → restart_server
+                                        └─ ★ Compute Engine API で inventory-mgmt を実リセット
+```
+
 ### 前提と設定
 
 - **調査対象のプロジェクトIDは環境変数 `SANDBOX_PROJECT_ID` から取得する**
-  (エージェント本体の `GOOGLE_CLOUD_PROJECT` とは別。未設定なら Cloud Assist
-  ツールは組み込まれず、従来のモック3システムだけで動く。eval / CI は未設定で実行)。
+  (エージェント本体の `GOOGLE_CLOUD_PROJECT` とは別。未設定なら GCP調査ツール
+  (Cloud Assist / BigQueryログ検索)は組み込まれず、モックデータの範囲だけで動く。
+  eval / CI は未設定で実行)。
 - Cloud Assist MCP は**プレビュー機能**。呼び出しには対象プロジェクトで
   `geminicloudassist.googleapis.com` の有効化と、呼び出しアカウントへの
   **`roles/mcp.toolUser` + `roles/geminicloudassist.user`** が必要
@@ -186,11 +271,26 @@ investigation_agent
 ```bash
 export SANDBOX_PROJECT_ID=your-sandbox-project-id   # デモ用に用意しているサンドボックス
 
+# --- シナリオ1: Cloud Run(store-app) ---
 make gcp-incident-create    # API有効化+ロール付与 → store-app デプロイ → 障害注入
-make run PROMPT="池袋店(店舗ID:2205)の田中です。店舗アプリが今朝10時ごろから全部エラーになります。店舗のハンディ端末すべてで発生していて、モバイルオーダーも止まっています。原因を調査して対応方針を提案してください。復旧作業は私の承認を得てから進めてください。"
-
+make run PROMPT="池袋店(店舗ID:2205)の田中です。店舗アプリが今朝10時ごろから全部エラーになります。店舗のハンディ端末すべてで発生していて、モバイルオーダーも止まっています。報告内容は以上の通りで間違いありませんので、このまま起票して調査を進めてください。復旧作業は私の承認を得てから進めてください。"
 make gcp-incident-resolve   # 承認・エスカレーション後の「インフラ運用チーム役」: 復旧
 make gcp-incident-clean     # デモ環境の削除
+
+# --- シナリオ2: GCE(store-web-fleet) ---
+make gce-incident-create    # GCE 3台 + BigQueryエクスポート作成 → 障害注入
+# (注入後8〜10分待つと OOM Killer が発動し、BigQuery に実証跡が入る)
+make run PROMPT="池袋店(店舗ID:2205)の田中です。店舗向けの案内ページ(店舗Webサーバー)が今日の夕方から表示が非常に遅く、時々エラー画面になります。他の店舗でも同じ症状と聞いています。報告内容は以上の通りで間違いありませんので、このまま起票して調査を進めてください。復旧作業は私の承認を得てから進めてください。"
+# → 承認すると restart_server が store-web-02 を実リセットして復旧する
+make gce-incident-break     # もう一度試す場合の障害再注入
+make gce-incident-clean     # GCEインスタンス3台の削除
+
+# --- シナリオ3: GCE(inventory-mgmt / 復旧のみ実GCP) ---
+make inventory-incident-create   # APサーバー役の GCE インスタンスを作成(障害注入は無し)
+make run PROMPT="渋谷店(店舗ID:1102)の佐藤です。在庫管理システムの在庫照会が今朝から30秒近くかかり、時々エラーになります。店内の端末2台で発生していて、棚卸業務に支障が出ています。報告内容は以上の通りで間違いありませんので、このまま起票して調査を進めてください。復旧作業は私の承認を得てから進めてください。"
+# → 承認すると restart_server が inventory-mgmt を実リセットする
+#   (実際に再起動されたことは make inventory-incident-status の操作履歴 operationType=reset で確認できる)
+make inventory-incident-clean    # インスタンスの削除
 ```
 
 障害の実体は Cloud Run サービス `store-app` の環境変数 `FAIL_MODE=db_timeout`
@@ -267,35 +367,39 @@ sre-agents/
 │   ├── agent.py                     # App(name="app") + root_agent
 │   ├── config.py                    # MODEL_ID, FIRESTORE_DATABASE, RUNBOOK_DIR, SANDBOX_PROJECT_ID
 │   ├── firestore_client.py          # named DB "sre-agents" の遅延シングルトン
-│   ├── mock_world.py                # 疑似システム4種の決定論的レジストリ
+│   ├── mock_world.py                # 疑似システム5種の決定論的レジストリ
 │   ├── sub_agents/
 │   │   ├── __init__.py              # build_model / build_generate_content_config
 │   │   ├── reception.py             # 受付エージェント(日本語 instruction)
 │   │   └── investigation.py         # 調査エージェント(HITL 手順を厳守)
 │   └── tools/
-│       ├── case_tools.py            # create/get/update support_case
+│       ├── case_tools.py            # propose_case_draft(起票前レビュー)+ create/get/update support_case
 │       ├── diagnostic_tools.py      # list_managed_systems / get_system_status / get_server_logs
 │       ├── gcp_assist.py            # ★ Gemini Cloud Assist リモートMCP ツールセット
+│       ├── gcp_logs.py              # ★ BigQuery ログエクスポート検索(GCEシナリオ)
 │       ├── knowledge_tools.py       # search_past_incidents / search_runbooks / record_resolution_log
-│       └── remediation_tools.py     # ★ propose_recovery_plan / restart_server / escalate_to_engineer
-├── data/runbooks/                   # 運用手順書 6 本(日本語)
+│       └── remediation_tools.py     # ★ propose_recovery_plan / restart_server(store-web-fleet / inventory-mgmt は実リセット)/ escalate_to_engineer
+├── data/runbooks/                   # 運用手順書 7 本(日本語)
 ├── scripts/
-│   ├── seed_firestore.py            # 過去対応ログ 6 件のシード(冪等)
+│   ├── seed_firestore.py            # 過去対応ログ 7 件のシード(冪等)
 │   ├── gcp_incident.sh              # GCP障害シナリオ(store-app/Cloud Run)の setup/deploy/break/resolve/clean
 │   ├── gcp_incident_app/            # store-app の実体(Flask、FAIL_MODE で障害切替)
 │   ├── gce_incident.sh              # GCEインフラ障害シナリオ(store-web-01/02/03)の setup/deploy/break/status/resolve/clean
-│   └── gce_incident_startup/        # store-web-* の起動スクリプト(base.sh / incident.sh)
+│   ├── gce_incident_startup/        # store-web-* の起動スクリプト(base.sh / incident.sh)
+│   └── inventory_incident.sh        # 在庫管理APサーバー役 GCE(inventory-mgmt)の create/status/resolve/clean
 ├── tests/
-│   ├── unit/                        # ユニットテスト 29 件(LLM 非依存)
+│   ├── unit/                        # ユニットテスト 45 件(LLM 非依存)
 │   │   ├── test_mock_world.py       # レジストリ整合性
 │   │   ├── test_search_logic.py     # キーワード検索の純関数
 │   │   ├── test_agent_wiring.py     # エージェント配線
 │   │   ├── test_gcp_assist.py       # Cloud Assist MCP 連携の配線(ネットワーク非依存)
-│   │   └── test_hitl_gating.py      # HITL ゲート(propose なしなら実施拒否)
+│   │   ├── test_gce_scenario.py     # GCEシナリオ(実リセット経路 / BigQueryツール)
+│   │   ├── test_hitl_gating.py      # HITL ゲート(propose なしなら実施拒否)
+│   │   └── test_intake_review.py    # 起票前レビューゲート(propose_case_draft なしなら起票拒否)
 │   ├── integration/                 # (scaffold の雛形。今は未使用)
 │   └── eval/
 │       ├── eval_config.yaml         # カスタムメトリクス 3 本(LLM判定 2 + 決定論 1)
-│       └── datasets/basic-dataset.json # 4 ケース
+│       └── datasets/basic-dataset.json # 5 ケース
 └── working/
     ├── implementation-log.md        # 実装作業ログ
     └── demo-scenarios.md            # サンドボックスの障害デモシナリオ一覧(ground truth・証跡・操作方法)
@@ -305,12 +409,13 @@ sre-agents/
 
 ## 評価(eval)
 
-4 ケース、全て満点(2026-07-13 時点):
+5 ケース、全て満点(2026-07-16 時点):
 
 | ケース | task_success | flow_compliance | trajectory_checks |
 |---|---|---|---|
 | `intake_interview_incomplete`(情報不足→追加質問) | 5.0 | 5.0 | 1.0 |
-| `propose_awaits_approval`(完全報告 → propose で停止) | 5.0 | 5.0 | 1.0 |
+| `intake_review_awaits_confirmation`(完全報告 → 起票前レビューで停止) | 5.0 | 5.0 | 1.0 |
+| `propose_awaits_approval`(完全報告+続行指示 → propose で停止) | 5.0 | 5.0 | 1.0 |
 | `pre_approved_resolution`(事前承認 + sales-mgmt → 再起動で復旧) | 5.0 | 5.0 | 1.0 |
 | `pre_approved_escalation`(事前承認 + order-mgmt → エスカレ) | 5.0 | 5.0 | 1.0 |
 
@@ -338,14 +443,14 @@ make deploy          # agents-cli deploy(Agent Runtime へ、所要5〜10分)
 
 ## 実装差し替えのポイント
 
-現在の復旧・エスカレーションはすべてモック。
+復旧・エスカレーションは基本モックで、
 [`app/tools/remediation_tools.py`](./app/tools/remediation_tools.py) の
-`restart_server` / `escalate_to_engineer` を実装差し替えるだけで実環境に接続可能:
+`restart_server` / `escalate_to_engineer` が実環境への差し替えポイント:
 
-| ツール | 差し替え先の例 |
-|---|---|
-| `restart_server` | Compute Engine API の instances.reset / MIG の rolling restart |
-| `escalate_to_engineer` | PagerDuty / Opsgenie / Slack webhook / Cloud Tasks |
+| ツール | 差し替え先の例 | 実装済みの実例 |
+|---|---|---|
+| `restart_server` | Compute Engine API の instances.reset / MIG の rolling restart | **`store-web-fleet` / `inventory-mgmt` は実装済み**(`SANDBOX_PROJECT_ID` 設定時、store-web-02 / inventory-mgmt を実リセット) |
+| `escalate_to_engineer` | PagerDuty / Opsgenie / Slack webhook / Cloud Tasks | (モックのまま) |
 
 シグネチャと返却契約(`{"status": ..., ...}` の dict)を維持すれば、
 エージェントの instruction や eval を書き換えずに実運用へ移行できる。

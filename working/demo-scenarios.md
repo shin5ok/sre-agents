@@ -103,20 +103,25 @@ make gce-incident-break     # resolve後にもう一度障害を試す場合
 make gce-incident-clean     # 3台のインスタンスを削除(ファイアウォール/BigQuery/sinkは残す)
 ```
 
-### 現状の制約・未実装(次にやるなら)
+### エージェント統合(2026-07-13 実装済み — 旧「未実装」の候補(b)を採用)
 
-1. **`investigation_agent` からはまだ調査できない**。`app/tools/diagnostic_tools.py` は
-   `mock_world.py` 専用の決定論的モックしか読まない。`app/tools/gcp_assist.py`
-   (Gemini Cloud Assist MCP)は同じ `SANDBOX_PROJECT_ID` を向いているため、
-   理論上 Compute Engine 層の情報(ログ・メトリクス)を拾える可能性があるが
-   **このシナリオでは未検証**(`store-app` では Cloud Run 向けの動作を確認済み)。
-2. エージェントから調査させたい場合の候補:
-   - (a) Cloud Assist の `investigate_issue` が Compute Engine / BigQuery エクスポート
-     テーブルをどこまで見られるか検証する
-   - (b) `bq query` を叩く専用ツール(例: `query_incident_bigquery_logs`)を新設し、
-     `mock_world.py` に5つ目の system_id(例: `store-web-fleet`)を登録して
-     `get_system_status` / `get_server_logs` 経由で誘導する
-3. **コスト**: `asia-northeast1` は Always Free 枠の対象外リージョン。e2-micro x3 は
+1. **system_id `store-web-fleet`(店舗Webサーバー群)を `mock_world.py` に登録済み。**
+   受付は「店舗向け案内ページが遅い/エラー」等の報告をこのシステムに紐づけられる。
+   モック側(`get_system_status` / `get_server_logs`)は監視サマリーのみ
+   (store-web-02 のメモリ急上昇・ヘルスチェック503)で、実ログへ誘導する。
+2. **調査**: `query_incident_bigquery_logs`(`app/tools/gcp_logs.py`)が
+   `sre_agents_demo_logs.syslog` をパラメータ化クエリで検索し、カーネルOOMの
+   一次証拠を取得する(LLM から生SQLは受け取らない。キーワード・期間・件数のみ)。
+   `SANDBOX_PROJECT_ID` 設定時のみエージェントに組み込まれる。
+3. **復旧**: `restart_server` は store-web-fleet に限り **Compute Engine API で
+   store-web-02 を実リセット**する(`mock_world.py` の `gce_restart_instance` キー、
+   実装は `app/tools/remediation_tools.py`。HITL承認は従来どおり必須)。
+   エージェント承認後の復旧が実VMに反映されるため、`make gce-incident-resolve` の
+   人手実行は不要(再注入は `make gce-incident-break`)。
+4. 手順書 `data/runbooks/store-web.md`、過去事例 INC-2026-0007(seed)も追加済み。
+   未検証で残っているのは Cloud Assist `investigate_issue` の Compute Engine 対応範囲
+   (旧候補(a))のみ。本シナリオは BigQuery 経由の証跡取得で完結する。
+5. **コスト**: `asia-northeast1` は Always Free 枠の対象外リージョン。e2-micro x3 は
    稼働中わずかに課金される。使わない時は `make gce-incident-clean`。
 
 ### 設計上の注意点(ハマりどころ)
@@ -132,3 +137,30 @@ make gce-incident-clean     # 3台のインスタンスを削除(ファイアウ
   allowlist 機能で使えない環境があるため、`scripts/gce_incident.sh` は
   `bq show --format=prettyjson` → JSON編集 → `bq update --source` で
   冪等にACLを付与している(`grant_bq_dataset_access` 関数)。
+
+---
+
+## シナリオ3: `inventory-mgmt`(GCE / 調査はモック・復旧のみ実GCP)
+
+**作成日**: 2026-07-16。在庫管理システム(従来からあるモックシナリオ)の
+**復旧操作だけ**を実GCPに反映する構成。store-web-fleet と違い、障害注入も
+BigQuery 調査も無い。
+
+| 項目 | 内容 |
+|---|---|
+| 実体 | Compute Engine インスタンス `inventory-mgmt`(e2-micro, asia-northeast1-a, bare Debian) |
+| 障害の入れ方 | 無し(障害の筋書きは `app/mock_world.py` の Java heap OOM ログで完結) |
+| 表面症状 | 在庫照会APIの極端な遅延(30秒前後)と断続的エラー(モック) |
+| 真の根本原因 | キャッシュローダーのメモリリークによるヒープ枯渇(モック。手順書 `inventory-mgmt.md`・過去事例 INC-2025-0002 と整合) |
+| 調査手段 | 従来どおり get_server_logs のモックログ + search_past_incidents + search_runbooks(BigQuery / Cloud Assist 不要) |
+| 期待される対応 | propose_recovery_plan(restart)→ 承認 → **restart_server が GCE インスタンス `inventory-mgmt` を実リセット** |
+| 操作 | `make inventory-incident-create` / `-status` / `-resolve` / `-clean` |
+| 必要な権限 | Compute Engine の操作権限のみ |
+
+- 仕組みは `mock_world.py` の `gce_restart_instance` / `gce_zone` キー
+  (`remediation_tools.py` の差し替え実装は store-web-fleet と共通)。
+  `platform` キーは意図的に付けていない — instruction の GCP調査節
+  (BigQuery 誘導)の対象外にし、調査をモックで完結させるため。
+- 実際に再起動されたことは `make inventory-incident-status` が表示する
+  Compute Engine の操作履歴(`operationType=reset`)で確認できる
+  (`lastStartTimestamp` は reset では更新されないので注意)。

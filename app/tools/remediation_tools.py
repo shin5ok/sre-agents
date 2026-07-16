@@ -1,9 +1,13 @@
 """復旧アクション・エスカレーション・HITL(承認)のツール。
 
-このモジュールはモック実装であり、実環境への差し替えポイント。
+基本はモック実装であり、実環境への差し替えポイント。
 実装を差し替える場合も、シグネチャと返却契約({"status": ...} を含む dict)は維持すること。
 (例: restart_server → Compute Engine API のインスタンス再起動、
  escalate_to_engineer → チケットシステム起票 + オンコール通知)
+
+差し替えの実例: mock_world のエントリに gce_restart_instance がある
+システム(store-web-fleet)は、SANDBOX_PROJECT_ID 設定時に restart_server が
+Compute Engine API で対象インスタンスを実際にリセットする(それ以外は従来のモック)。
 
 HITL(Human-in-the-Loop): 破壊的な復旧操作を実施する前に、必ず
 propose_recovery_plan で計画を提示して担当者の承認を得るフローになっている。
@@ -13,9 +17,23 @@ restart_server / escalate_to_engineer は state["recovery_plan_proposed"] が
 
 from google.adk.tools import ToolContext
 
+from app.config import get_sandbox_project_id
 from app.mock_world import SYSTEMS
 
 VALID_ACTION_TYPES = ("restart", "escalate")
+
+
+def _reset_gce_instance(project_id: str, zone: str, instance: str) -> None:
+    """Compute Engine インスタンスをリセットし、API操作の完了まで待つ。
+
+    リセット操作自体は数秒で完了する(OS起動はその後1分程度続く)。
+    テストではこの関数を monkeypatch して実呼び出しを差し替える。
+    """
+    from google.cloud import compute_v1
+
+    client = compute_v1.InstancesClient()
+    operation = client.reset(project=project_id, zone=zone, instance=instance)
+    operation.result(timeout=90)
 
 
 def propose_recovery_plan(
@@ -107,6 +125,37 @@ def restart_server(system_id: str, tool_context: ToolContext) -> dict:
             )
             + " 手順書に従い escalate_to_engineer でエスカレーションしてください。",
         }
+
+    # 実環境差し替え済みのシステム(GCEホスト)は対象インスタンスを実際にリセットする
+    gce_instance = entry.get("gce_restart_instance")
+    sandbox_project = get_sandbox_project_id()
+    if gce_instance and sandbox_project:
+        try:
+            _reset_gce_instance(
+                project_id=sandbox_project,
+                zone=entry["gce_zone"],
+                instance=gce_instance,
+            )
+        except Exception as e:
+            return {
+                "status": "error",
+                "system_id": system_id,
+                "message": (
+                    f"インスタンス {gce_instance} の再起動に失敗しました: {e}。"
+                    "escalate_to_engineer でのエスカレーションを検討してください。"
+                ),
+            }
+        message = (
+            f"{entry['display_name']} の対象インスタンス {gce_instance}"
+            f"(project={sandbox_project})を Compute Engine API でリセットしました。"
+            "OSの起動完了まで1分程度かかります。get_system_status で稼働状態を確認してください。"
+        )
+    else:
+        message = (
+            f"{entry['display_name']} のアプリケーションサーバーを再起動しました。"
+            "get_system_status で稼働状態を確認してください。"
+        )
+
     remediated = list(tool_context.state.get("remediated_systems") or [])
     if system_id not in remediated:
         remediated.append(system_id)
@@ -114,8 +163,7 @@ def restart_server(system_id: str, tool_context: ToolContext) -> dict:
     return {
         "status": "success",
         "system_id": system_id,
-        "message": f"{entry['display_name']} のアプリケーションサーバーを再起動しました。"
-        "get_system_status で稼働状態を確認してください。",
+        "message": message,
     }
 
 

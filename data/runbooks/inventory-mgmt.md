@@ -2,13 +2,20 @@
 
 ## システム概要
 店舗の在庫照会・棚卸・自動補充計算を行うシステム。APサーバー(Java)構成。
+**APサーバーは GCPサンドボックスプロジェクト上の Compute Engine インスタンス
+inventory-mgmt(asia-northeast1-a)で稼働。**
 システムID: inventory-mgmt
 
 ## 既知事象: OutOfMemoryError による極端な遅延
 - 症状: 在庫照会が極端に遅い(30秒前後)。断続的にエラーが発生する。
 - ログの特徴: `java.lang.OutOfMemoryError: Java heap space`、`Full GC (Ergonomics)` の連発。
 - 原因: キャッシュローダーのメモリリークによるヒープ枯渇。
-- 対応: **APサーバーの再起動**(common-restart.md の標準手順に従う)。
+- 対応: **APサーバー(インスタンス inventory-mgmt)の再起動**
+  (common-restart.md の標準手順に従う)。
+  restart_server はこのシステムでは対象インスタンスの実際のリセットを実行する。
+  実施前に必ず propose_recovery_plan で承認を得ること(作業影響: 再起動中の
+  1〜2分間、在庫照会・棚卸・自動補充計算が利用できない)。
+  再起動後、get_system_status で回復を確認する。
 - 恒久対応: ヒープサイズ増強とキャッシュ処理の改修(計画済み)。
 
 ## 既知事象: 夜間バッチ(在庫同期)の遅延

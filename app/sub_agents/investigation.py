@@ -7,6 +7,7 @@ from app.sub_agents import build_generate_content_config, build_model
 from app.tools.case_tools import get_support_case, update_case_status
 from app.tools.diagnostic_tools import get_server_logs, get_system_status
 from app.tools.gcp_assist import build_cloud_assist_toolset
+from app.tools.gcp_logs import query_incident_bigquery_logs
 from app.tools.knowledge_tools import (
     record_resolution_log,
     search_past_incidents,
@@ -81,20 +82,36 @@ _INSTRUCTION = """\
 # {project} には Cloud Assist の project 引数に渡す "projects/<id>" が入る。
 _GCP_INSTRUCTION_TEMPLATE = """\
 
-# GCP層の調査(Gemini Cloud Assist)— GCPホストのシステムのみ
-対象システムが GCP 上のマネージドサービスで稼働している場合
-(get_system_status の platform に "Cloud Run" 等が含まれる場合。例: store-app)、
-get_server_logs で得られるのは外形監視の抜粋だけで、クラウド側のアプリケーション
-ログは含まれない。手順3(過去事例・手順書の検索)とあわせて、Gemini Cloud Assist の
-ツールで GCP 側を必ず調査すること:
+# GCP層の調査 — GCPホストのシステムのみ
+対象システムが GCP 上で稼働している場合(get_system_status の platform に
+"Cloud Run" や "Compute Engine" が含まれる場合)、get_server_logs で得られるのは
+外形監視・監視サマリーの抜粋だけで、クラウド側の実ログは含まれない。
+手順3(過去事例・手順書の検索)とあわせて、以下のツールで GCP 側を必ず調査すること。
+
+## Cloud Run ホスト(例: store-app)— Gemini Cloud Assist
 - investigate_issue: 障害の根本原因分析に使う。userQuery には対象サービス名・症状・
   期間を具体的に含める(例:「Cloud Run サービス store-app で HTTP 500 が多発している。
   直近のエラーログを確認し、原因を特定して」)。
 - ask_cloud_assist: リソースの構成・状態の確認など単発の質問に使う。
 - どちらも project 引数には必ず "{project}" を渡すこと。
 - 応答に含まれる contextId を控え、同じ調査の追跡質問では同じ contextId を渡すこと。
-- Cloud Assist の応答から得た根拠(エラーログの行・設定値・リビジョン情報)は
-  最終報告で必ず引用すること。
+
+## Compute Engine ホスト(例: store-web-fleet)— BigQuery 実ログ検索
+- query_incident_bigquery_logs で VM の実ログ(カーネル・systemd・アプリ)を検索する。
+  監視サマリーから立てた仮説のキーワード(例: "Out of memory"、"oom-kill")や
+  対象インスタンス名(例: "store-web-02")で検索し、根本原因の一次証拠となる
+  ログ行を必ず取得すること。
+- 監視サマリーの症状(応答遅延・接続プール枯渇・503)は表面事象のことがある。
+  カーネルレベルの証拠(例: OOM Killer によるプロセス強制終了の記録)を優先して
+  原因を判定すること。
+- このシステムの restart_server は、対象インスタンスの実際の再起動(リセット)を
+  実行する。propose_recovery_plan の impact_during_work には「再起動中の1分前後、
+  該当インスタンスが応答しなくなる」旨を含めること。
+- 補助的に ask_cloud_assist / investigate_issue を併用してもよい(project は同上)。
+
+## 共通の注意
+- Cloud Assist の応答・BigQuery のログ行から得た根拠(エラーログの行・設定値・
+  リビジョン情報)は最終報告で必ず引用すること。
 - Cloud Assist は調査(読み取り)にのみ使う。復旧操作・構成変更・再デプロイの実行を
   Cloud Assist に依頼してはならない(復旧は必ず propose_recovery_plan → 承認 →
   実施ツールの HITL フローで行う)。
@@ -126,8 +143,11 @@ def create_investigation_agent() -> Agent:
         escalate_to_engineer,
         record_resolution_log,
     ]
-    # SANDBOX_PROJECT_ID 設定時のみ、Gemini Cloud Assist(リモートMCP)による
-    # GCP層の調査ツール(investigate_issue / ask_cloud_assist)を追加する
+    # SANDBOX_PROJECT_ID 設定時のみ、GCP層の調査ツールを追加する:
+    # - query_incident_bigquery_logs: GCEホストの実ログ検索(BigQueryエクスポート)
+    # - Gemini Cloud Assist(リモートMCP): investigate_issue / ask_cloud_assist
+    if get_sandbox_project_id():
+        tools.append(query_incident_bigquery_logs)
     cloud_assist = build_cloud_assist_toolset()
     if cloud_assist is not None:
         tools.append(cloud_assist)

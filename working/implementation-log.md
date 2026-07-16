@@ -505,3 +505,145 @@ propose の後に続けて実施系ツールを呼び、対応ログ記録まで
   組み込み済み(このセッションでは IAM 変更が承認されず人間の実行待ち)。
 - ユニットテスト 29 件 / `agents-cli lint` 全て pass。eval への影響なし
   (eval は SANDBOX_PROJECT_ID なしで実行される)。
+
+---
+
+## 2026-07-13: GCEシナリオ(store-web-fleet)のエージェント統合
+
+**ゴール**: working/demo-scenarios.md のシナリオ2(store-web-02 / メモリリーク→OOM)を
+investigation_agent から調査・復旧できるようにする(旧「未実装」候補(b)を採用 + 実復旧まで実装)。
+
+### 追加・変更点
+
+- `app/mock_world.py`: 5つ目の system_id **`store-web-fleet`**(店舗Webサーバー群 /
+  Compute Engine 3台)。モックは監視サマリーのみ(store-web-02 のメモリ急上昇 + 503、
+  他2台正常)で、実ログへ誘導する。`gce_restart_instance: store-web-02` /
+  `gce_zone` キーを追加。
+- `app/tools/gcp_logs.py`(新規): **`query_incident_bigquery_logs`** —
+  `sre_agents_demo_logs.syslog`(Cloud Logging → BigQuery エクスポート)への
+  パラメータ化キーワード検索(生SQL不可、期間・件数は上限クランプ)。
+  SANDBOX_PROJECT_ID 設定時のみエージェントに組み込み。
+- `app/tools/remediation_tools.py`: **restart_server の実環境差し替えを実装** —
+  mock_world エントリに `gce_restart_instance` があるシステムは、SANDBOX_PROJECT_ID
+  設定時に Compute Engine API(google-cloud-compute)で対象インスタンスを実リセット
+  (operation 完了待ち90s)。失敗時は status=error を返し remediated 扱いにしない。
+  他システムは従来のモックのまま。HITL ゲートは不変。
+- `app/sub_agents/investigation.py`: GCP調査節を Cloud Run / Compute Engine の
+  2層構成に拡張(GCE は BigQuery 実ログ優先、カーネル証拠 > 表面症状、
+  restart は実リセットである旨と作業影響の明示を指示)。
+- 手順書 `data/runbooks/store-web.md`(OOM→再起動 / 全台ダウン→エスカレ)、
+  seed INC-2026-0007、ユニットテスト6件追加(実リセット経路の分岐・失敗時の挙動・
+  BigQueryツールのガード)。計35件。
+- 依存追加: google-cloud-bigquery / google-cloud-compute(main dependencies)。
+
+### 検証結果(sandbox = your-sandbox-project-id)
+
+- BigQuery ツール実測: "Out of memory" 検索で本物のカーネルOOM行を取得。
+- **エージェント E2E(事前承認付き)完全成功**: 受付が store-web-fleet に起票 →
+  調査が query_incident_bigquery_logs("store-web-02" / "oom-kill" / "memleak")で
+  カーネルの `Out of memory: Killed process (python3)` と
+  `memleak.service: Failed with result 'oom-kill'` を発見 → 過去事例 INC-2026-0007・
+  手順書 store-web.md と突き合わせ → propose(restart、実ログ引用)→
+  **restart_server が store-web-02 を Compute Engine API で実リセット** →
+  healthy 確認 → 対応ログ記録 → resolved でクローズ。
+- E2E 後に `gce_incident.sh break` で障害を再注入済み(デモは再アーム状態)。
+
+### 発覚した問題と対処: .env の SANDBOX_PROJECT_ID で eval が全滅
+
+- `.env` に SANDBOX_PROJECT_ID が入ったことで eval も GCP ツール込みで走るようになり、
+  **agents-cli 0.5.1 の eval generate が `tools` 内の McpToolset を関数として
+  `inspect.signature` に掛けて "not a callable object" で 4/4 全滅**(`agents-cli run`
+  の実行経路は問題なし)。
+- ADK は `.env` を `override=True` で読むため、シェルで `SANDBOX_PROJECT_ID=` と
+  空にしても .env の値に上書きされる。→ .env に存在しない別名の明示スイッチ
+  **`SANDBOX_TOOLS_DISABLED=1`** を `get_sandbox_project_id()` に実装し、
+  `make eval` が常に付与する構成にした。
+- 対処後の eval: 4ケース全て満点(task_success 5.0 / flow_compliance 5.0 /
+  trajectory 1.0)。ユニットテスト36件・lint 全て green。
+
+---
+
+## 2026-07-16: 在庫管理システム(inventory-mgmt)の復旧を実GCEリセット化
+
+**ゴール**: 在庫管理システムのAPサーバー障害のケースで、実際に GCE インスタンス
+`inventory-mgmt` を再起動する対処にする(store-web-fleet と同じ差し替え実装の適用。
+店舗Webに続く2例目だが、こちらは**調査はモックのまま・復旧のみ実GCP**という逆パターン)。
+
+### 追加・変更点
+
+- `app/mock_world.py`: inventory-mgmt に `gce_restart_instance: "inventory-mgmt"` /
+  `gce_zone: "asia-northeast1-a"` を追加。`remediation_tools.py` の既存の差し替え実装が
+  そのまま適用される(コード変更なし)。`platform` キーは意図的に付けない —
+  instruction の GCP調査節(BigQuery誘導)の対象外にして、調査はモックログ
+  (Java heap OOM)で完結させるため。
+- `data/runbooks/inventory-mgmt.md`: APサーバーが GCE インスタンス inventory-mgmt で
+  稼働する旨、restart_server が実リセットである旨、作業影響(1〜2分)を追記
+  (store-web.md と同じ流儀。propose の impact 文言の情報源になる)。
+- `scripts/inventory_incident.sh`(新規)+ `make inventory-incident-{create,status,resolve,clean}`:
+  APサーバー役の e2-micro(bare Debian、障害注入なし)を管理。status は
+  Compute Engine の操作履歴(`operationType=reset`)を表示する —
+  **`lastStartTimestamp` は reset では更新されない**ため、実リセットの確認は操作履歴で行う。
+- テスト: test_gce_scenario.py を (system_id, instance) でパラメータ化し
+  store-web-fleet / inventory-mgmt の両方で実リセット経路・失敗時挙動・モック
+  フォールバックを検証(あわせて SANDBOX_TOOLS_DISABLED が環境に残っていても
+  壊れないよう delenv を追加)。test_mock_world.py に gce_restart_instance
+  エントリの整合性テストを追加。計40件。
+- eval への影響なし(SANDBOX_TOOLS_DISABLED=1 で従来のモック動作)。
+
+### 検証結果(sandbox = your-sandbox-project-id)
+
+- ツール層: `restart_server("inventory-mgmt")`(承認済み state)が Compute Engine API で
+  実リセット → 操作履歴に `reset DONE`(01:16)、シリアルコンソールに2回目の
+  カーネル起動ログを確認。失敗時 error / remediated 非登録はユニットテストで担保。
+- **エージェント E2E(事前承認付き)完全成功**: 受付が inventory-mgmt に起票
+  (CASE-20260716-171908)→ 調査がモックログの OutOfMemoryError / Full GC を引用 →
+  過去事例 INC-2025-0002・手順書 inventory-mgmt.md(更新後の「インスタンス
+  inventory-mgmt の再起動」)と突き合わせ → propose(restart、影響1〜2分)→
+  **restart_server が inventory-mgmt を実リセット**(操作履歴 reset DONE 01:19)→
+  healthy 確認 → 対応ログ記録 → resolved でクローズ。
+- ユニットテスト40件・lint(ruff / format / codespell / ty)全て green。
+
+---
+
+## 2026-07-16: 起票前レビュー(受付HITL) — 調査開始前のケース内容確認
+
+**ゴール**: サポートケースを作る条件(必須6項目)がそろったら、調査を始める前に
+起票内容を報告者に一度レビューしてもらうステップを挟む(復旧側 HITL と対の
+受付側 HITL。二重ゲートが2箇所になった)。
+
+### 追加・変更点
+
+- `app/tools/case_tools.py`: **`propose_case_draft`**(新規)— 起票内容7項目を
+  `state["case_draft"]` に登録して提示、`awaiting_confirmation` を返す。
+  **`create_support_case` はドラフト未登録(または system_id 不一致)なら
+  エラー返却で起票拒否**。起票成功時にドラフトをクリア(使い回し防止)。
+- `app/sub_agents/reception.py`: 進め方を「揃ったら即起票(確認待ちしない)」から
+  「propose_case_draft で提示 → 確認待ちで応答終了 → 確認後に起票」へ変更。
+  例外: 依頼文に内容確定・続行の明示(「以上の内容で対応をお願いします」
+  「そのまま実施」「このまま起票して」「追加の承認・確認は不要」等)があれば
+  同一応答内で起票まで進む(復旧の事前承認と同じ流儀。単発 make run が壊れない)。
+- eval: ケース5本に(**`intake_review_awaits_confirmation`** 追加 =
+  続行指示なしの完全報告 → レビュー停止が正解)。`propose_awaits_approval` の
+  プロンプトに「このまま起票して…進めてください」の続行指示を追加。
+  task_success のゴール分岐を4本に再構成、flow_compliance に起票前レビュー段階を追加、
+  trajectory に draft_reviewed_before_case チェックを追加。
+  **ジャッジの落とし穴**: トレースが1依頼を複数 turn に分割して見えるため、
+  「間に user 発話がなければ止まったと判定しない」注意書きを flow_compliance に
+  追加(これがないと事前承認ケースが「止まってから実行した」と誤読され 4.0 になる)。
+- README: アーキテクチャ図・HITL要点・経路(4→5)・GCPシナリオの単発プロンプト
+  3本に続行指示文を追加。ユニットテスト45件・eval 5ケース表記に更新。
+- テスト: `tests/unit/test_intake_review.py`(新規5件、Firestore は fake client で遮断)、
+  wiring テストに propose_case_draft 追加。計45件。
+
+### 検証結果
+
+- ライブ多段フロー: 続行指示なしの完全報告 → **propose_case_draft 提示で停止**
+  →「はい」で **起票 → 調査 → propose_recovery_plan 提示で停止** → 「承認します」で
+  **restart_server(inventory-mgmt 実リセット)→ healthy → resolved**(3段HITL完走)。
+- 続行指示あり(Makefile 既定 PROMPT)は1ターンで レビュー提示 → 起票 → 調査 →
+  propose 停止を確認(従来の単発デモ互換)。
+- eval 5ケース全て満点(task_success 5.0 / flow_compliance 5.0 / trajectory 1.0)。
+  ユニットテスト45件・lint 全て green。
+- 注: SPEC.md のフロー(「必要な情報が揃ったら起票」)には起票前レビューの記述が
+  ないため、本変更はユーザー指示によるフロー拡張として本ログと README に記録
+  (SPEC 側は未改訂)。

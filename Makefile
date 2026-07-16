@@ -6,9 +6,10 @@ REGION ?= asia-northeast1
 FIRESTORE_DB ?= sre-agents
 PROMPT ?= 渋谷店(店舗ID:1102)です。売上管理システムで今朝9時頃からレジ2台の会計時に売上送信がタイムアウトします。報告者は佐藤です。以上の内容で対応をお願いします。
 
-.PHONY: all install db-create seed run chat playground test eval eval-compare lint deploy-setup deploy \
+.PHONY: all install db-create seed run chat welcome playground test eval eval-compare lint deploy-setup deploy \
 	gcp-incident-create gcp-incident-status gcp-incident-resolve gcp-incident-clean \
-	gce-incident-create gce-incident-break gce-incident-status gce-incident-resolve gce-incident-clean
+	gce-incident-create gce-incident-break gce-incident-status gce-incident-resolve gce-incident-clean \
+	inventory-incident-create inventory-incident-status inventory-incident-resolve inventory-incident-clean
 
 all: install seed test
 
@@ -38,6 +39,10 @@ run:
 chat:
 	agents-cli run --start-server "$(PROMPT)"
 
+# ウェルカム画面の確認(受付エージェントが「SRE エージェントへようこそ」を返す)
+welcome:
+	agents-cli run "こんにちは"
+
 # adk web の対話UI
 playground:
 	agents-cli playground --port 18080
@@ -49,8 +54,10 @@ test:
 	uv run pytest tests/unit
 
 # eval 実行(generate + grade。結果は artifacts/ 配下)
+# SANDBOX_TOOLS_DISABLED=1: .env に SANDBOX_PROJECT_ID があっても GCPツールなしの
+# 従来構成で評価する(agents-cli 0.5.1 の eval generate は McpToolset 非対応で落ちる)
 eval:
-	agents-cli eval run
+	SANDBOX_TOOLS_DISABLED=1 agents-cli eval run
 
 # eval 結果の比較(make eval-compare BASE=... CAND=...)
 eval-compare:
@@ -100,6 +107,26 @@ gce-incident-resolve:
 # デモ環境の削除(3台のインスタンスを削除。firewall/BigQuery/sinkは残す)
 gce-incident-clean:
 	scripts/gce_incident.sh clean
+
+## 在庫管理APサーバー(inventory-mgmt / restart_server の実リセット対象) --------
+# 対象プロジェクトは環境変数 SANDBOX_PROJECT_ID(未設定ならエラー。他シナリオと共通)
+# 障害の筋書きはモックログで完結するため break は無い(復旧対象のVMだけを用意する)
+
+# inventory-mgmt インスタンス(e2-micro)を作成(存在すればスキップ)
+inventory-incident-create:
+	scripts/inventory_incident.sh create
+
+# インスタンスの稼働状態と最終起動時刻(リセットで更新)を表示
+inventory-incident-status:
+	scripts/inventory_incident.sh status
+
+# インスタンスを手動リセット(エージェントの restart_server と同等)
+inventory-incident-resolve:
+	scripts/inventory_incident.sh resolve
+
+# インスタンスを削除
+inventory-incident-clean:
+	scripts/inventory_incident.sh clean
 
 ## デプロイ -------------------------------------------------------------------
 

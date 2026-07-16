@@ -33,6 +33,14 @@ def get_sandbox_project_id() -> str | None:
 
     環境変数 SANDBOX_PROJECT_ID から取得する(エージェント自身の実行プロジェクト
     GOOGLE_CLOUD_PROJECT とは別物)。未設定なら None を返し、その場合
-    Gemini Cloud Assist の MCP ツールセットはエージェントに組み込まれない。
+    GCP調査ツール(Cloud Assist MCP / BigQueryログ検索)は組み込まれず、
+    restart_server の実リセットも無効になる。
+
+    SANDBOX_TOOLS_DISABLED が真値なら SANDBOX_PROJECT_ID があっても None。
+    .env に SANDBOX_PROJECT_ID を書いた状態でも eval を従来構成で回すための
+    明示スイッチ(agents-cli 0.5.1 の eval generate は tools 内の McpToolset を
+    関数と誤解して落ちるため、make eval が設定する)。
     """
+    if os.environ.get("SANDBOX_TOOLS_DISABLED"):
+        return None
     return os.environ.get("SANDBOX_PROJECT_ID") or None

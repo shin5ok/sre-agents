@@ -37,11 +37,23 @@ def test_log_excerpts_contain_expected_anomalies():
         "inventory-mgmt": "java.lang.OutOfMemoryError",
         "order-mgmt": "No space left on device",
         "store-app": "returned 5xx",
+        "store-web-fleet": "memory usage 95%",
     }
     for system_id, marker in anomalies.items():
         joined = "\n".join(SYSTEMS[system_id]["log_excerpt"])
         assert marker in joined, f"{system_id} のログに診断根拠となる異常行がない"
         assert len(SYSTEMS[system_id]["log_excerpt"]) >= 8
+
+
+def test_gce_restart_entries_are_consistent():
+    """gce_restart_instance を持つシステム(restart_server が実リセットする対象)の整合性。"""
+    gce_systems = {s: e for s, e in SYSTEMS.items() if e.get("gce_restart_instance")}
+    assert set(gce_systems) == {"store-web-fleet", "inventory-mgmt"}
+    for system_id, entry in gce_systems.items():
+        assert entry.get("gce_zone"), f"{system_id}: gce_zone が未定義"
+        assert entry["restartable"] is True, (
+            f"{system_id}: 実リセット対象なのに restartable=False"
+        )
 
 
 def test_demo_covers_both_restart_and_escalation_paths():

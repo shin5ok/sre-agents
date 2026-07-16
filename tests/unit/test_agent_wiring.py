@@ -39,19 +39,23 @@ def test_root_is_reception_with_investigation_sub_agent():
 def test_reception_tools():
     assert _function_tool_names(root_agent) == {
         "list_managed_systems",
+        "propose_case_draft",
         "create_support_case",
     }
 
 
 def test_investigation_tools_cover_spec_flow():
     investigation = root_agent.sub_agents[0]
-    assert _function_tool_names(investigation) == INVESTIGATION_FUNCTION_TOOLS
-    # Cloud Assist の MCP ツールセットは SANDBOX_PROJECT_ID 設定時のみ付く
+    expected = set(INVESTIGATION_FUNCTION_TOOLS)
+    # GCP調査ツール(BigQueryログ検索 + Cloud Assist MCP)は
+    # SANDBOX_PROJECT_ID 設定時のみ付く
     toolsets = [t for t in investigation.tools if isinstance(t, McpToolset)]
     if os.environ.get("SANDBOX_PROJECT_ID"):
+        expected |= {"query_incident_bigquery_logs"}
         assert len(toolsets) == 1
     else:
         assert toolsets == []
+    assert _function_tool_names(investigation) == expected
 
 
 def test_agents_use_pinned_model():

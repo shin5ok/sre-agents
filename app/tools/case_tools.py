@@ -1,4 +1,12 @@
-"""サポートケース(support_cases コレクション)の起票・参照・更新ツール。"""
+"""サポートケース(support_cases コレクション)の起票・参照・更新ツール。
+
+起票前レビュー(受付HITL): 必須項目が揃っても、いきなり起票はしない。
+propose_case_draft で起票内容を報告者に提示して確認を得てから
+create_support_case を呼ぶフローになっている(調査開始前のレビューステップ)。
+create_support_case は state["case_draft"] が未登録の場合はエラーを返して
+起票を拒否する(instruction + ツール層の防御深化。復旧側の
+propose_recovery_plan → restart_server/escalate_to_engineer と同じ流儀)。
+"""
 
 import datetime
 from zoneinfo import ZoneInfo
@@ -16,7 +24,7 @@ def _now_jst() -> str:
     return datetime.datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(timespec="seconds")
 
 
-def create_support_case(
+def propose_case_draft(
     store_id: str,
     store_name: str,
     system_id: str,
@@ -26,10 +34,11 @@ def create_support_case(
     reporter_name: str,
     tool_context: ToolContext,
 ) -> dict:
-    """聞き取りが完了した障害報告をサポートケースとしてデータベースに起票する。
+    """起票前レビュー(HITL): 聞き取った起票内容を報告者に提示し、確認を求める。
 
-    必須項目(店舗ID・店舗名・対象システムID・症状・発生日時・影響範囲・報告者名)が
-    すべて揃ってから呼び出すこと。
+    必須項目がすべて揃ったら、create_support_case を呼ぶ前に必ず本ツールを呼ぶこと。
+    本ツール自体は起票を行わない(内容の登録・提示のみ)。呼び出し後は原則として
+    応答を一旦終了し、次のユーザー入力で報告者の確認を待つこと。
 
     Args:
         store_id: 店舗ID(例: "1102")
@@ -41,8 +50,86 @@ def create_support_case(
         reporter_name: 報告者名
 
     Returns:
-        起票結果。成功時は case_id を含む。
+        確認待ちであることを示すレスポンス。
     """
+    if system_id not in mock_world.SYSTEMS:
+        return {
+            "status": "error",
+            "message": f"未知のシステムIDです: {system_id}。"
+            "list_managed_systems で正式なIDを確認してください。",
+        }
+    draft = {
+        "store_id": store_id,
+        "store_name": store_name,
+        "system_id": system_id,
+        "system_name": mock_world.SYSTEMS[system_id]["display_name"],
+        "symptom": symptom,
+        "started_at": started_at,
+        "impact_scope": impact_scope,
+        "reporter_name": reporter_name,
+    }
+    tool_context.state["case_draft"] = draft
+    return {
+        "status": "awaiting_confirmation",
+        "draft": draft,
+        "message": (
+            "上記の起票内容を報告者に提示しました。"
+            "報告者の明示的な確認(「はい」「この内容でお願いします」等)を得てから "
+            "create_support_case を呼び出してください。"
+            "修正の依頼があれば、内容を訂正して再度本ツールを呼び出してください。"
+            "報告者の依頼文に内容の確定や確認省略の明示が既に含まれている場合を除き、"
+            "確認がない状態で create_support_case を呼び出さないでください。"
+        ),
+    }
+
+
+def create_support_case(
+    store_id: str,
+    store_name: str,
+    system_id: str,
+    symptom: str,
+    started_at: str,
+    impact_scope: str,
+    reporter_name: str,
+    tool_context: ToolContext,
+) -> dict:
+    """聞き取りが完了し、報告者が内容を確認済みの障害報告をサポートケースとして起票する。
+
+    必須項目(店舗ID・店舗名・対象システムID・症状・発生日時・影響範囲・報告者名)が
+    すべて揃い、propose_case_draft で起票内容を報告者に提示して確認を得てから
+    呼び出すこと。
+
+    Args:
+        store_id: 店舗ID(例: "1102")
+        store_name: 店舗名(例: "渋谷店")
+        system_id: 対象システムの正式ID。list_managed_systems が返すIDを指定する(例: "sales-mgmt")
+        symptom: 具体的な症状(エラーメッセージや画面の状態を含む)
+        started_at: 発生日時(報告者の申告どおりの表現でよい)
+        impact_scope: 影響範囲(何台・何店舗・どの業務に支障が出ているか)
+        reporter_name: 報告者名
+
+    Returns:
+        起票結果。成功時は case_id を含む。起票前レビュー未実施の場合は error。
+    """
+    draft = tool_context.state.get("case_draft")
+    if not draft:
+        return {
+            "status": "error",
+            "message": (
+                "起票前レビュー未実施のため起票を拒否しました。"
+                "先に propose_case_draft で起票内容を報告者に提示し、"
+                "確認を得てから再度呼び出してください。"
+            ),
+        }
+    if draft.get("system_id") != system_id:
+        return {
+            "status": "error",
+            "message": (
+                f"提示済みの起票内容(system_id={draft.get('system_id')})と"
+                f"対象システム({system_id})が一致しません。"
+                "内容を変更する場合は propose_case_draft からやり直してください。"
+            ),
+        }
     if system_id not in mock_world.SYSTEMS:
         return {
             "status": "error",
@@ -75,6 +162,8 @@ def create_support_case(
     get_client().collection(CASES_COLLECTION).document(case_id).set(case)
     tool_context.state["case_id"] = case_id
     tool_context.state["system_id"] = system_id
+    # 次のケースでは改めて起票前レビューが必要(ドラフトの使い回しを防ぐ)
+    tool_context.state["case_draft"] = None
     return {"status": "success", "case_id": case_id, "case": case}
 
 

@@ -843,6 +843,22 @@ wheels = [
 ]
 
 [[package]]
+name = "google-cloud-compute"
+version = "1.49.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "google-api-core", extra = ["grpc"] },
+    { name = "google-auth" },
+    { name = "grpcio" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/89/b1/650f139db1f62c65a633d9f82f804e5562b4dee425e334abc24cd1bc8520/google_cloud_compute-1.49.0.tar.gz", hash = "sha256:75a7bb4118cad05ae5fefdfc3a5bdb573d5aacf131bb21f7a3bee457aa744f77", size = 5527685, upload-time = "2026-06-25T23:39:34.14Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e0/97/6e560906f3c598accfdca3e907689fb758908e3aa87ef1f4074f381027c5/google_cloud_compute-1.49.0-py3-none-any.whl", hash = "sha256:398ff33a1cbd012494a2b7a8c977dbb118e489c7df549f5b07095cc0943882a6", size = 4173321, upload-time = "2026-06-25T23:39:01.012Z" },
+]
+
+[[package]]
 name = "google-cloud-core"
 version = "2.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2973,6 +2989,8 @@ source = { editable = "." }
 dependencies = [
     { name = "gcsfs" },
     { name = "google-adk", extra = ["gcp", "mcp"] },
+    { name = "google-cloud-bigquery" },
+    { name = "google-cloud-compute" },
     { name = "google-cloud-firestore" },
     { name = "google-cloud-logging" },
     { name = "opentelemetry-instrumentation-google-genai" },
@@ -3003,6 +3021,8 @@ requires-dist = [
     { name = "google-adk", extras = ["eval"], marker = "extra == 'eval'", specifier = ">=2.0.0,<3.0.0" },
     { name = "google-adk", extras = ["gcp", "mcp"], specifier = ">=2.0.0,<3.0.0" },
     { name = "google-cloud-aiplatform", extras = ["evaluation"], marker = "extra == 'eval'", specifier = ">=1.156.0" },
+    { name = "google-cloud-bigquery", specifier = ">=3.30.0,<4.0.0" },
+    { name = "google-cloud-compute", specifier = ">=1.19.0,<2.0.0" },
     { name = "google-cloud-firestore", specifier = ">=2.28.0" },
     { name = "google-cloud-logging", specifier = ">=3.12.0,<4.0.0" },
     { name = "opentelemetry-instrumentation-google-genai", specifier = ">=0.1.0,<1.0.0" },

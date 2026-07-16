@@ -23,12 +23,25 @@ def _instruction_text(agent) -> str:
     return agent.instruction
 
 
+def test_sandbox_tools_disabled_flag_wins(monkeypatch):
+    # .env が SANDBOX_PROJECT_ID を注入しても、eval 用の明示スイッチで無効化できる
+    monkeypatch.setenv("SANDBOX_PROJECT_ID", SANDBOX)
+    monkeypatch.setenv("SANDBOX_TOOLS_DISABLED", "1")
+    assert gcp_assist.build_cloud_assist_toolset() is None
+    agent = create_investigation_agent()
+    assert _toolsets(agent) == []
+    assert "Cloud Assist" not in _instruction_text(agent)
+
+
 def test_toolset_absent_without_sandbox_project(monkeypatch):
     monkeypatch.delenv("SANDBOX_PROJECT_ID", raising=False)
     assert gcp_assist.build_cloud_assist_toolset() is None
     agent = create_investigation_agent()
     assert _toolsets(agent) == []
     assert "Cloud Assist" not in _instruction_text(agent)
+    assert "query_incident_bigquery_logs" not in {
+        t.__name__ for t in agent.tools if callable(t)
+    }
 
 
 def test_toolset_present_with_sandbox_project(monkeypatch):
@@ -40,6 +53,11 @@ def test_toolset_present_with_sandbox_project(monkeypatch):
     assert len(_toolsets(agent)) == 1
     # instruction に project 引数の値("projects/<id>")が展開されている
     assert f"projects/{SANDBOX}" in _instruction_text(agent)
+    # GCE層の調査ツール(BigQueryログ検索)も同時に組み込まれる
+    assert "query_incident_bigquery_logs" in {
+        t.__name__ for t in agent.tools if callable(t)
+    }
+    assert "Compute Engine" in _instruction_text(agent)
     # 調査(読み取り)系のみ公開する(mutative な invoke_operation 等は含めない)
     assert set(gcp_assist.CLOUD_ASSIST_TOOLS) == {
         "investigate_issue",

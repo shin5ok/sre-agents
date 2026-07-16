@@ -115,6 +115,42 @@ SEED_INCIDENTS: list[dict] = [
         "recorded_at": "2026-05-27T18:45:00+09:00",
         "source": "seed",
     },
+    {
+        "incident_id": "INC-2026-0007",
+        "case_id": None,
+        "system_id": "store-web-fleet",
+        "title": "店舗Webサーバーのヘルスチェック失敗(メモリリーク→OOM)",
+        "symptom": (
+            "store-web-02 のみ応答遅延とヘルスチェック503。メモリ使用率が"
+            "74%→88%→95%と継続上昇。他の2台は正常。"
+        ),
+        "root_cause": (
+            "常駐プロセスのメモリリークによるメモリ枯渇。BigQuery のログエクスポートで"
+            "カーネルの「Out of memory: Killed process (python3)」と"
+            "「memleak.service: Failed with result 'oom-kill'」を確認。"
+            "OOM Killer に強制終了されたプロセスは自動復旧せずサービス劣化が継続。"
+        ),
+        "action_taken": (
+            "手順書に基づき、承認を得て該当インスタンス store-web-02 を再起動"
+            "(Compute Engine リセット)し復旧。恒久対応としてリークプロセスの"
+            "修正を開発チームへ起票。"
+        ),
+        "outcome": "resolved",
+        "escalated": False,
+        "tags": [
+            "店舗Web",
+            "GCE",
+            "Compute Engine",
+            "OOM",
+            "メモリリーク",
+            "再起動",
+            "BigQuery",
+            "oom-kill",
+        ],
+        "occurred_at": "2026-06-18",
+        "recorded_at": "2026-06-18T15:30:00+09:00",
+        "source": "seed",
+    },
 ]
 
 

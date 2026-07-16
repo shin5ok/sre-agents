@@ -5,9 +5,16 @@ eval の安定性のため、乱数や現在時刻に依存する値を一切含
 シナリオ整合: 各システムのログ異常は data/runbooks/ の既知事象および
 scripts/seed_firestore.py の過去対応ログと同じ結論(再起動 or エスカレーション)を指す。
 
-store-app のみ「GCP実環境と接続する例」: ここにあるのは外形監視の抜粋だけで、
-クラウド側の実体(Cloud Run サービス)は scripts/gcp_incident.sh で
-SANDBOX_PROJECT_ID のプロジェクトに作成し、Gemini Cloud Assist(MCP)で調査する。
+store-app / store-web-fleet / inventory-mgmt は「GCP実環境と接続する例」:
+クラウド側の実体は SANDBOX_PROJECT_ID のプロジェクトに作成する。
+- store-app: Cloud Run(scripts/gcp_incident.sh)。調査は Gemini Cloud Assist(MCP)。
+  ここにあるのは外形監視サマリーの抜粋だけ。
+- store-web-fleet: Compute Engine 3台(scripts/gce_incident.sh)。調査は
+  BigQuery ログエクスポート(query_incident_bigquery_logs)。restart_server は
+  実際に対象インスタンスをリセットする(gce_restart_instance)。
+- inventory-mgmt: 調査はここのモックログ(Java heap OOM)で完結するが、
+  restart_server は Compute Engine インスタンス inventory-mgmt を実際に
+  リセットする(scripts/inventory_incident.sh がインスタンスを管理)。
 """
 
 SYSTEMS: dict[str, dict] = {
@@ -39,6 +46,10 @@ SYSTEMS: dict[str, dict] = {
         "status": "degraded",
         "status_detail": "在庫照会APIの極端な遅延(30秒前後)と断続的なエラー",
         "restartable": True,
+        # SANDBOX_PROJECT_ID 設定時、restart_server はこのインスタンスを実リセットする
+        # (調査はモックログで完結。復旧操作だけが実GCPに反映される構成)
+        "gce_restart_instance": "inventory-mgmt",
+        "gce_zone": "asia-northeast1-a",
         "healthy_detail": "全API正常応答(p95レイテンシ220ms)、夜間バッチ正常",
         "log_excerpt": [
             "2026-07-09 07:40:11.031 INFO  [scheduler-1] c.e.inv.batch.StockSyncJob - nightly stock sync started (stores=1200)",
@@ -82,6 +93,37 @@ SYSTEMS: dict[str, dict] = {
             "2026-07-13 09:14:04.233 INFO  [synthetic-monitor] GET https://store-app-*.run.app/ -> 500 (2101ms) probe=tokyo-1",
             "2026-07-13 09:14:34.301 ERROR [edge-gateway] upstream error: store-app (Cloud Run) returned 5xx for 28/30 requests in last 60s",
             "2026-07-13 09:15:04.377 INFO  [synthetic-monitor] GET https://store-app-*.run.app/ -> 500 (1967ms) probe=tokyo-2",
+        ],
+    },
+    "store-web-fleet": {
+        "display_name": "店舗Webサーバー群",
+        "description": (
+            "店舗向け案内ページ・キャンペーン情報を配信するWebサーバー群"
+            "(GCPサンドボックスプロジェクト上の Compute Engine インスタンス "
+            "store-web-01 / store-web-02 / store-web-03)"
+        ),
+        "platform": "Compute Engine(GCPサンドボックスプロジェクト / asia-northeast1-a)",
+        "status": "degraded",
+        "status_detail": (
+            "監視エージェントが store-web-02 のヘルスチェック失敗(HTTP 503)と"
+            "メモリ使用率の急上昇(95%)を検知。store-web-01 / store-web-03 は正常。"
+            "カーネル・systemd・アプリの実ログは本ツールには含まれない"
+            "(query_incident_bigquery_logs で BigQuery のログエクスポートを調査すること)。"
+        ),
+        "restartable": True,
+        # SANDBOX_PROJECT_ID 設定時、restart_server はこのインスタンスを実リセットする
+        "gce_restart_instance": "store-web-02",
+        "gce_zone": "asia-northeast1-a",
+        "healthy_detail": "store-web-01/02/03 全台ヘルスチェック 200 OK、メモリ使用率正常",
+        "log_excerpt": [
+            "2026-07-13 18:20:11 WARN  [monitoring-agent] store-web-02 memory usage 74% (rising)",
+            "2026-07-13 18:24:35 WARN  [app:store-app] store-web-02 response_time_ms=2870 (threshold 1000)",
+            "2026-07-13 18:27:02 ERROR [app:store-app] store-web-02 db connection pool exhausted (50/50 in use)",
+            "2026-07-13 18:29:18 WARN  [monitoring-agent] store-web-02 memory usage 88% (rising)",
+            "2026-07-13 18:31:44 ERROR [healthcheck] store-web-02 GET /healthz -> 503 (2 consecutive failures)",
+            "2026-07-13 18:33:05 WARN  [monitoring-agent] store-web-02 memory usage 95% rss (critical)",
+            "2026-07-13 18:33:20 INFO  [healthcheck] store-web-01 GET /healthz -> 200, store-web-03 GET /healthz -> 200",
+            "2026-07-13 18:33:21 WARN  [monitoring-agent] これは監視サマリーです。カーネル・systemd の実ログは BigQuery ログエクスポート(query_incident_bigquery_logs)で確認してください。",
         ],
     },
     "order-mgmt": {
