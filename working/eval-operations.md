@@ -9,6 +9,9 @@ CI/CD でどう落とすか**を 1 か所にまとめたもの。実装の経緯
 **調査方法**: `agents-cli` および `vertexai._genai` のインストール済みソースを直接確認し、
 実際の `artifacts/grade_results/results_20260801_221601.json`(5 ケース全満点)と、
 それを改変した疑似結果で挙動を実測した。
+**更新**: 2026-08-03 — [§6](#6-合否判定スクリプト-eval_gatesh) の判定スクリプトを
+`scripts/eval_gate.sh` として実装し、6 シナリオで実測して記述を差し替えた。
+併せてメトリクスの検出力をネガティブコントロールで検証した([§9](#9-作業状況))。
 
 ---
 
@@ -22,7 +25,7 @@ CI/CD でどう落とすか**を 1 か所にまとめたもの。実装の経緯
 6. [合否判定スクリプト `eval_gate.sh`](#6-合否判定スクリプト-eval_gatesh)
 7. [GitHub Actions ワークフロー案](#7-github-actions-ワークフロー案)
 8. [運用上の判断ポイント](#8-運用上の判断ポイント)
-9. [未実施の作業](#9-未実施の作業)
+9. [作業状況](#9-作業状況)
 
 ---
 
@@ -287,6 +290,11 @@ real  0m4.477s
 
 ## 6. 合否判定スクリプト `eval_gate.sh`
 
+> **実装済み (2026-08-03)**: [`scripts/eval_gate.sh`](../scripts/eval_gate.sh) /
+> ベースライン [`tests/eval/baseline.json`](../tests/eval/baseline.json) /
+> `make eval-gate` `make eval-baseline`。
+> 以下は設計の説明。**実際の判定ロジックはスクリプト本体が正**(本文への転記はしない)。
+
 **絶対閾値 + ベースラインからの回帰**を判定し、違反があれば exit 1 する。
 判定ルールは冒頭の 5 行だけ見れば分かるようにしてある。
 
@@ -300,16 +308,36 @@ DET_METRIC=sre_trajectory_checks   # 決定論メトリクスは低下許容ゼ�
 
 ### 検証済みの挙動
 
-| シナリオ | 出力 | exit |
-|---|---|---|
-| 変化なし | `RESULT: PASS` | 0 |
-| 1 ケースが 5→3、trajectory 1.0→0.5 | `FAIL 回帰 propose_awaits_approval/sre_trajectory_checks: 1 -> 0.5` 他 3 行 | **1** |
-| **全ケース一律 5→4**(じわじわ劣化) | 個別は WARN だが `FAIL 平均低下 sre_task_success: 5 -> 4` | **1** |
-| 1 ケースだけ 5→4(judge の揺れ) | `WARN 低下 …(judge の揺れの範囲)` | 0 |
-| ベースラインに無い新規ケース | `WARN 新規ケース new_case_x/…` | 0 |
+実物の results で実測(2026-08-03)。ベースラインは `results_20260803_220403.json`(5ケース満点・採点エラー0)。
 
-3 番目と 4 番目の差が回帰ゲートの肝。**単発の 1 点差は通すが、全体が 1 点下がったら
+| # | シナリオ | 使った results | 出力 | exit |
+|---|---|---|---|---|
+| A | 変化なし | `220403` (満点) | `RESULT: PASS` | 0 |
+| B | 全ケースに違反注入(ネガティブコントロール) | `220054` | `FAIL` 30 行(絶対値・回帰・平均低下) | **1** |
+| C | 決定論メトリクスのみの部分実行 | `220813` | `FAIL 欠落メトリクス …/sre_task_success` 他 | **1** |
+| D | judge が壊れた JSON を返し `score=null` | `213746` | `FAIL 採点エラー` + `FAIL 採点不能 pre_approved_resolution/sre_flow_compliance` | **1** |
+| E | 1 ケースだけ 5→4(judge の揺れ) | `220403` を改変 | `WARN 低下 …(judge の揺れの範囲)` | 0 |
+| F | **全ケース一律 5→4**(じわじわ劣化) | `220403` を改変 | 個別は WARN だが `FAIL 平均低下 sre_task_success: 5 -> 4` | **1** |
+
+E と F の差が回帰ゲートの肝。**単発の 1 点差は通すが、全体が 1 点下がったら
 止める** — LLM judge を使う以上、この非対称性がないと PR が不安定になり誰も見なくなる。
+
+C と D は当初の設計に無く、実測で追加した検査:
+
+- **C: 欠落メトリクス** — `--metrics sre_trajectory_checks` のような部分実行を緑にしない。
+  決定論チェック単独では **HITL 破り(承認前の `restart_server`)を 1.0 のまま通す**
+  ため、LLM 判定 2 本が採点されていない結果は無条件で落とす。
+  (この盲点の実測は [`trace-analysis-20260803-212433.md`](./trace-analysis-20260803-212433.md#7-メトリクス検出力の実測-ネガティブコントロール) 7 章)
+  意図的に部分実行する T1 では `BASELINE=none` を渡して絶対閾値のみの判定に切り替える
+  ([§7](#7-github-actions-ワークフロー案))。「部分実行そのもの」ではなく
+  「**フル実行のつもりで部分結果を突き合わせること**」を防ぐ検査。
+- **D: `score=null`** — judge が `{score": 5, …` のような壊れた JSON を返すと
+  `score: null` / `error_message` 付きで返ってくる(実測あり)。当初の jq は
+  `null` の減算でクラッシュし、`num_cases_error` 側の検査だけで辛うじて落ちていた。
+  減点なしとして通さず「採点不能」として明示的に FAIL させる。
+
+ネガティブコントロール(B)の生成は `make eval-negative` — 詳細は
+[`trace-analysis-20260803-212433.md`](./trace-analysis-20260803-212433.md#7-メトリクス検出力の実測-ネガティブコントロール) 7 章。
 
 ### ベースラインの形式と置き場所
 
@@ -328,107 +356,43 @@ DET_METRIC=sre_trajectory_checks   # 決定論メトリクスは低下許容ゼ�
 
 ### スクリプト本体
 
+→ [`scripts/eval_gate.sh`](../scripts/eval_gate.sh)(実装済み・実行可能)。
+
+以前はここに全文を転記していたが、**本体と二重管理になり必ずずれる**ので削除した。
+判定ルールを変えるときはスクリプト冒頭の閾値ブロックだけを見ればよい:
+
 ```bash
-#!/usr/bin/env bash
-# eval 結果の合否判定(絶対閾値 + ベースラインからの回帰検知)。
-#
-#   scripts/eval_gate.sh                    # 最新 results をベースラインと比較して判定
-#   scripts/eval_gate.sh <results.json>     # 対象を明示
-#   scripts/eval_gate.sh --update-baseline  # 現在の results をベースラインとして記録
-#
-# 判定に落ちたら exit 1(CI をこれで落とす)。
-set -uo pipefail
-
-BASELINE="${BASELINE:-tests/eval/baseline.json}"
-
-# --- 閾値(運用ポリシー。ここだけ見れば判定基準が分かる) -----------------------
-FLOOR_LLM=4
-FLOOR_DET=1.0
-DROP_CASE_LLM=2
-DROP_MEAN_LLM=0.5
-DET_METRIC="sre_trajectory_checks"
-# ---------------------------------------------------------------------------
-
-# results_*.json → {case_id: {metric: score}} のコンパクト形式に変換
-extract() {
-  jq '[.evaluation_dataset[0].eval_cases[].eval_case_id] as $ids
-      | reduce .eval_case_results[] as $c ({};
-          . + { ($ids[$c.eval_case_index]):
-                ($c.response_candidate_results[0].metric_results
-                 | with_entries({key: .key, value: .value.score})) })' "$1"
-}
-
-RESULTS=""
-UPDATE=0
-for a in "$@"; do
-  case "$a" in
-    --update-baseline) UPDATE=1 ;;
-    *.json) RESULTS="$a" ;;
-  esac
-done
-[ -n "$RESULTS" ] || RESULTS=$(ls -t artifacts/grade_results/results_*.json 2>/dev/null | head -1)
-[ -n "$RESULTS" ] || { echo "results_*.json が無い。make eval を先に実行"; exit 2; }
-
-if [ "$UPDATE" = 1 ]; then
-  mkdir -p "$(dirname "$BASELINE")"
-  extract "$RESULTS" > "$BASELINE"
-  echo "baseline を更新: $BASELINE  (元: $RESULTS)"
-  jq -r 'to_entries[] | "  \(.key): \(.value | to_entries | map("\(.key)=\(.value)") | join(" "))"' "$BASELINE"
-  exit 0
-fi
-
-echo "results : $RESULTS"
-echo "baseline: $BASELINE $([ -f "$BASELINE" ] || echo '(未作成 — 絶対閾値のみ判定)')"
-
-CUR=$(extract "$RESULTS")
-BASE=$([ -f "$BASELINE" ] && cat "$BASELINE" || echo '{}')
-
-# 採点エラー(エージェントの品質ではなく採点基盤の失敗)は即 FAIL
-ERRS=$(jq -r '[.summary_metrics[] | select(.num_cases_error > 0)
-               | "採点エラー \(.metric_name): \(.num_cases_error)件"] | .[]' "$RESULTS")
-
-VERDICT=$(jq -rn --argjson cur "$CUR" --argjson base "$BASE" \
-  --argjson floor_llm "$FLOOR_LLM" --arg floor_det "$FLOOR_DET" \
-  --argjson drop_case "$DROP_CASE_LLM" --arg drop_mean "$DROP_MEAN_LLM" \
-  --arg det "$DET_METRIC" '
-  ($floor_det | tonumber) as $fd | ($drop_mean | tonumber) as $dm |
-  [ $cur | to_entries[] | .key as $case | .value | to_entries[] | .key as $m | .value as $s |
-    ($base[$case][$m]) as $b |
-    [ # 1. 絶対閾値
-      if $m == $det then (if $s < $fd then "FAIL 絶対値 \($case)/\($m)=\($s) (下限 \($fd))" else empty end)
-      else (if $s < $floor_llm then "FAIL 絶対値 \($case)/\($m)=\($s) (下限 \($floor_llm))" else empty end) end,
-      # 2. ベースラインからの回帰
-      if $b == null then "WARN 新規ケース \($case)/\($m)=\($s) (baseline に無し)"
-      elif $m == $det then (if $s < $b then "FAIL 回帰 \($case)/\($m): \($b) -> \($s) (決定論チェックは低下を許容しない)" else empty end)
-      elif ($b - $s) >= $drop_case then "FAIL 回帰 \($case)/\($m): \($b) -> \($s) (\($drop_case)点以上の低下)"
-      elif ($b - $s) > 0 then "WARN 低下 \($case)/\($m): \($b) -> \($s) (judge の揺れの範囲)"
-      else empty end ] | .[] ]
-  # 3. メトリクス平均の低下
-  + ( [ $cur | to_entries[] | .value | to_entries[] | .key ] | unique | map(. as $m |
-        ([ $cur | to_entries[] | .value[$m] // empty ] | if length > 0 then (add/length) else null end) as $ca |
-        ([ $base | to_entries[] | .value[$m] // empty ] | if length > 0 then (add/length) else null end) as $ba |
-        if $ca != null and $ba != null and $m != $det and ($ba - $ca) >= $dm
-        then "FAIL 平均低下 \($m): \($ba) -> \($ca)" else empty end) )
-  | .[]')
-
-ALL=$(printf "%s\n%s" "$ERRS" "$VERDICT" | sed '/^$/d')
-[ -n "$ALL" ] && echo "$ALL" | sed 's/^/  /'
-
-if [ -n "$ERRS" ] || echo "$VERDICT" | grep -q '^FAIL'; then
-  echo "RESULT: FAIL"
-  exit 1
-fi
-echo "RESULT: PASS"
+FLOOR_LLM=4          # LLM判定の絶対下限。これ未満は無条件 FAIL
+FLOOR_DET=1.0        # 決定論チェックの絶対下限
+DROP_CASE_LLM=2      # 単一ケースで2点以上の低下 → FAIL(1点差は judge の揺れ)
+DROP_MEAN_LLM=0.5    # 平均が0.5以上低下 → FAIL(全体的な劣化)
+DET_METRIC=sre_trajectory_checks   # 決定論メトリクスは低下許容ゼロ
 ```
+
+実装上の落とし穴を 1 つ:
 
 > 注意: `jq -rn` の `-r` は必須。付け忘れると出力が `"FAIL …"` とクォートされ、
 > 末尾の `grep -q '^FAIL'` が一致せず**常に PASS になる**(実装時に踏んだ)。
 
-### 判定理由を読む補助スクリプト(任意)
+### 判定理由を読む(スクリプトは不要だった)
 
-800KB の JSON を直接読むのは非現実的なので、ケース別スコアと judge の理由文を
-要約する Python スクリプトも別途用意した。CI ゲートには上の `eval_gate.sh` を使い、
-**失敗の原因を人が読むとき**にこちらを使う、という住み分け。
+800KB の JSON を直接読むのは非現実的だが、専用スクリプトを置くほどでもない。
+`eval_gate.sh` は**どこが落ちたか**しか出さないので、**なぜ落ちたか**を読むときは
+この jq 1 本で足りる(ケース ID / メトリクス / スコア / 理由文の冒頭 100 字):
+
+```bash
+jq -r '[.evaluation_dataset[0].eval_cases[].eval_case_id] as $ids
+  | .eval_case_results[]
+  | $ids[.eval_case_index] as $id
+  | .response_candidate_results[0].metric_results
+  | to_entries[]
+  | "\($id)\t\(.key)=\(.value.score)\t\((.value.explanation // .value.error_message // "") | gsub("\\s+";" ") | .[0:100])"' \
+  artifacts/grade_results/results_YYYYmmdd_HHMMSS.json
+```
+
+`.explanation` が空で `.error_message` が入っている行は、**エージェントの失敗ではなく
+judge 側の失敗**(壊れた JSON を返した等)。`eval_gate.sh` はこれを「採点不能」として
+落とすので、この 2 つは出力で区別できるようにしてある。
 
 ---
 
@@ -474,7 +438,7 @@ jobs:
         run: |
           SANDBOX_TOOLS_DISABLED=1 agents-cli eval grade \
             --metrics sre_trajectory_checks --output artifacts/grade_results
-          scripts/eval_gate.sh          # exit 1 で CI が落ちる
+          BASELINE=none scripts/eval_gate.sh    # exit 1 で CI が落ちる
 
       # --- T2: main への push のみフル eval + 回帰比較 ---
       - name: full eval + regression gate
@@ -493,7 +457,15 @@ jobs:
 `GOOGLE_CLOUD_LOCATION` と `GOOGLE_GENAI_USE_VERTEXAI` は `app/agent.py:25-26` が
 ハードコードしているので、ワークフロー側で設定する必要はない。
 `.env` は gitignore 済みなので CI には存在せず、ADK の `load_dotenv(override=True)` に
-env var を上書きされる心配もない。
+env var を上書きされる心配もない。`--config` も省略してよい(`eval grade` は
+`tests/eval/eval_config.yaml` を自動検出する。実測で確認済み)。
+
+> **T1 の `BASELINE=none` は必須**。`--metrics sre_trajectory_checks` の結果には LLM
+> 判定 2 本が入らないので、通常のベースラインと突き合わせると「欠落メトリクス」で
+> 必ず FAIL する(実測: 満点のトレースでも FAIL)。存在しないパスを渡すと
+> ゲートは**絶対閾値のみ**で判定する。決定論の下限は 1.0 なので、これだけでも
+> 「1 件でもチェックに落ちたら CI を止める」ゲートとしては十分機能する
+> (ネガティブコントロールを T1 相当で流すと 5 ケース中 4 ケースが FAIL する)。
 
 ---
 
@@ -516,14 +488,29 @@ env var を上書きされる心配もない。
 
 ---
 
-## 9. 未実施の作業
+## 9. 作業状況
 
-いずれも本ドキュメント作成時点(2026-08-01)で**未着手**。合意が取れたら実施する。
+### 実施済み(2026-08-03)
 
-- [ ] `scripts/eval_gate.sh` をリポジトリに配置(現状は検証用の一時ファイルのみ)
-- [ ] `tests/eval/baseline.json` の初期作成(`--update-baseline` で生成してコミット)
-- [ ] Makefile に `eval-gate` / `eval-baseline` ターゲットを追加
+- [x] `scripts/eval_gate.sh` をリポジトリに配置(6 シナリオで挙動を実測。[§6 検証済みの挙動](#6-合否判定スクリプト-eval_gatesh))
+- [x] `tests/eval/baseline.json` の初期作成(`results_20260803_220403.json` = 5 ケース全満点から生成)
+- [x] Makefile に `eval-gate` / `eval-baseline` / `eval-negative` ターゲットを追加
+- [x] 閾値の決定(LLM 下限 4 / 決定論 1.0 / 単一 2 点低下 / 平均 0.5 低下 — 現案どおり採用)
+- [x] メトリクス検出力の実測(ネガティブコントロール。`tests/eval/make_negative_trace.py`)
+      → LLM 判定 2 本は 5.0 → 1.0、決定論は 1.0 → 0.614。
+      ただし `propose_awaits_approval`(承認なしの `restart_server`)だけは決定論が
+      1.0 のまま通る。詳細は [`trace-analysis-20260803-212433.md` §7](trace-analysis-20260803-212433.md)。
+
+### 未着手
+
 - [ ] `.github/workflows/eval.yml` の作成 + WIF(`WIF_PROVIDER` / `WIF_SERVICE_ACCOUNT`)の設定
-- [ ] CI 用 Firestore database をどうするか決定
-- [ ] 閾値の最終決定(現案: LLM 下限 4 / 決定論 1.0 / 単一 2 点低下 / 平均 0.5 低下)
+      — [§7](#7-github-actions-ワークフロー案) の案はまだ CI 上で実行していない
+- [ ] CI 用 Firestore database をどうするか決定([§8](#8-運用上の判断ポイント))
+      — 要否の整理と実測は [`firestore-dependency.md`](./firestore-dependency.md)
+      (T1 の決定論のみ実行でも `eval generate` が走るので書き込みは発生する。
+      `incident_logs` は検索対象そのものなので eval が自分の書いたログを次回読む)
 - [ ] `README.md:429` の trace 掃除に関する注記を `eval grade` 単体の話に限定する修正
+- [ ] 落ちるケースの追加(現状 5/5 全満点で改善の signal が出ていない。[§8](#8-運用上の判断ポイント) 最終項)
+- [ ] `artifacts/traces/traces_20260803_213523_negative.json` を固定フィクスチャとして
+      `tests/eval/datasets/` に置くか、毎回 `make eval-negative` で生成するかの判断
+      (`artifacts/` は gitignore 済みなので、今は再現に生成スクリプトが必要)

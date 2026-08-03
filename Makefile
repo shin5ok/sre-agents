@@ -1,12 +1,20 @@
 # SRE障害対応エージェント 共通コマンド
 # (SPEC の要件: よく使うコマンドはすべて make で実行できること)
 
+# PROJECT_ID は本リポジトリの GCP プロジェクト(Firestore の sre-agents DB がある場所)。
+# シェルに PROJECT_ID が export されていると ?= では環境変数側が勝ってしまい、
+# db-create / eval が無関係のプロジェクトを向いてしまうため、環境由来の値は無視する。
+# コマンドラインでの上書き(make PROJECT_ID=... )は従来どおり有効。
+ifeq ($(origin PROJECT_ID), environment)
+PROJECT_ID := your-project-id
+endif
 PROJECT_ID ?= your-project-id
 REGION ?= asia-northeast1
 FIRESTORE_DB ?= sre-agents
 PROMPT ?= 渋谷店(店舗ID:1102)です。売上管理システムで今朝9時頃からレジ2台の会計時に売上送信がタイムアウトします。報告者は佐藤です。以上の内容で対応をお願いします。
 
-.PHONY: all install db-create seed run chat welcome playground test eval eval-compare lint deploy-setup deploy \
+.PHONY: all install db-create seed run chat welcome playground test eval eval-compare eval-negative \
+	eval-gate eval-baseline lint deploy-setup deploy \
 	gcp-incident-create gcp-incident-status gcp-incident-resolve gcp-incident-clean \
 	gce-incident-create gce-incident-break gce-incident-status gce-incident-resolve gce-incident-clean \
 	inventory-incident-create inventory-incident-status inventory-incident-resolve inventory-incident-clean
@@ -56,12 +64,39 @@ test:
 # eval 実行(generate + grade。結果は artifacts/ 配下)
 # SANDBOX_TOOLS_DISABLED=1: .env に SANDBOX_PROJECT_ID があっても GCPツールなしの
 # 従来構成で評価する(agents-cli 0.5.1 の eval generate は McpToolset 非対応で落ちる)
+# GOOGLE_CLOUD_PROJECT: Firestore(sre-agents DB)のあるプロジェクトを明示する。
+# eval の inference runner は .env を override=False で読むため、シェルに別プロジェクトが
+# export されていると .env より優先され、Firestore 403 で調査系ケースが全滅する。
 eval:
-	SANDBOX_TOOLS_DISABLED=1 agents-cli eval run
+	SANDBOX_TOOLS_DISABLED=1 GOOGLE_CLOUD_PROJECT=$(PROJECT_ID) agents-cli eval run
 
 # eval 結果の比較(make eval-compare BASE=... CAND=...)
 eval-compare:
 	agents-cli eval compare $(BASE) $(CAND)
+
+# メトリクスの検出力テスト(ネガティブコントロール)。
+# 正常トレースに1ケース1件ずつ違反を注入したトレースを作り、それを grade する。
+# 満点が「エージェントが正しい」からなのか「メトリクスが失敗を拾えていない」からなのかを
+# 切り分けるためのもの。全メトリクスが下がれば検出力あり。
+#   make eval-negative TRACES=artifacts/traces/traces_YYYYmmdd_HHMMSS.json
+TRACES ?= $(shell ls -t artifacts/traces/traces_*.json 2>/dev/null | grep -v _negative | head -1)
+
+# eval 結果の合否判定(絶対閾値 + ベースラインからの回帰)。CI はこれで落とす。
+# agents-cli eval grade の exit コードはスコアを見ないため、判定は本スクリプトが行う。
+#   make eval-gate                              # 最新 results を判定
+#   make eval-gate RESULTS=artifacts/...json    # 対象を明示
+#   make eval-baseline                          # 現在の results をベースラインに記録
+eval-gate:
+	scripts/eval_gate.sh $(RESULTS)
+
+eval-baseline:
+	scripts/eval_gate.sh --update-baseline $(RESULTS)
+
+eval-negative:
+	@test -n "$(TRACES)" || { echo "no trace file found; run 'make eval' first or pass TRACES=..."; exit 1; }
+	uv run python tests/eval/make_negative_trace.py $(TRACES)
+	SANDBOX_TOOLS_DISABLED=1 GOOGLE_CLOUD_PROJECT=$(PROJECT_ID) agents-cli eval grade \
+		--traces $(basename $(TRACES))_negative.json --config tests/eval/eval_config.yaml
 
 lint:
 	agents-cli lint

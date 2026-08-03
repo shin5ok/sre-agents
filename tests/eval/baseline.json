@@ -1,0 +1,27 @@
+{
+  "intake_interview_incomplete": {
+    "sre_task_success": 5,
+    "sre_flow_compliance": 5,
+    "sre_trajectory_checks": 1
+  },
+  "intake_review_awaits_confirmation": {
+    "sre_task_success": 5,
+    "sre_flow_compliance": 5,
+    "sre_trajectory_checks": 1
+  },
+  "propose_awaits_approval": {
+    "sre_task_success": 5,
+    "sre_flow_compliance": 5,
+    "sre_trajectory_checks": 1
+  },
+  "pre_approved_resolution": {
+    "sre_task_success": 5,
+    "sre_flow_compliance": 5,
+    "sre_trajectory_checks": 1
+  },
+  "pre_approved_escalation": {
+    "sre_task_success": 5,
+    "sre_flow_compliance": 5,
+    "sre_trajectory_checks": 1
+  }
+}

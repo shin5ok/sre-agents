@@ -4,6 +4,12 @@
 # evaluation" で拒否するため、カスタムメトリクス(LLM判定2本 + 決定論的チェック2本)で評価する。
 # 全ケースを単一turn(prompt フィールド)で書いているため {prompt} が判定に使える。
 # 継続形式(agent_data)を導入する場合は {prompt} を再度外すこと。
+#
+# 注意: ここに書ける名前は下の custom_metrics で定義した名前のみ。未定義の名前
+# (scaffold 既定値の custom_llm_judge / custom_code_check 等)を書くとマネージド
+# メトリクス名として扱われ、GCS 取得に失敗して eval 全体が落ちる。
+# reference / context を持たない現行データセットでは final_response_match /
+# grounding も採点できないので追加しないこと。
 metrics_to_run:
   - sre_task_success
   - sre_flow_compliance
