@@ -12,53 +12,157 @@ Google ADK 2.x / Python / Vertex AI(Gemini)/ Firestore で構築。
 ## 概要
 
 現状は「店舗の障害申請 → 受付が起票 → 運用エンジニアがログ調査・復旧」というチェーンで
-時間がかかる。ここに 2 つの AI エージェントを入れる:
+時間がかかる。ここを ADK 2.x の **グラフワークフロー**(`app/graph/`)に置き換える。
+LLM に任せる判断は 2 つだけで、それ以外の手順はグラフのエッジが決定的に決める:
 
 - **受付エージェント(reception_agent)** — 店舗からの障害報告を日本語で聞き取り、
   必須項目(店舗ID・店舗名 / 対象システム / 症状 / 発生日時 / 影響範囲 / 報告者名)が
-  揃ったら**起票内容を報告者に提示して確認を取り(起票前レビュー)**、確認後に
-  Firestore にサポートケースを起票し、調査エージェントへ引き継ぐ
+  揃ったかを構造化して返す(`IntakeResult`)
 - **調査エージェント(investigation_agent)** — サーバー状態・ログ確認、
-  過去対応ログ検索 + 運用手順書検索を経て**復旧計画を提示 → 承認待ち(HITL)**、
-  承認後に復旧(モック)またはエスカレーションを実行、対応ログを Firestore に記録
+  過去対応ログ検索 + 運用手順書検索を経て**復旧計画**を構造化して返す(`RecoveryPlan`)
+
+起票・承認ゲート・復旧の実施・対応ログ記録は LLM のツール選択ではなく
+グラフの関数ノード(`app/graph/nodes.py`)が行う。
 
 ## アーキテクチャ
 
-```
-User(店舗) ── report ──► reception_agent (root)
-                             │
-                             ▼ ★ 起票前レビュー(必須6項目が揃ったら)
-                       propose_case_draft
-                          {店舗 / システム / 症状 / 発生日時 / 影響範囲 / 報告者}
-                             │
-                             ▼ ── 報告者の確認 ──►(未確認なら停止)
-                             │
-                       create_support_case ──► Firestore(support_cases)
-                             │
-                             ▼ transfer_to_agent
-                       investigation_agent (sub-agent)
-                             │
-                             ├─ update_case_status("investigating")
-                             ├─ get_system_status + get_server_logs
-                             ├─ search_past_incidents + search_runbooks
-                             │
-                             ▼ ★ HITL(復旧実施前の承認ステップ)
-                       propose_recovery_plan
-                          {原因 / 作業内容 / 作業種別 / 作業中の影響}
-                             │
-                             ▼ ── 担当者の承認 ──►(未承認なら停止)
-                             │
-                             ├─ restart_server(モック) or escalate_to_engineer(モック)
-                             ├─ record_resolution_log ──► Firestore(incident_logs)
-                             └─ update_case_status("resolved" or "escalated")
+### ワークフローグラフ(`app/graph/`)
+
+```mermaid
+flowchart TD
+    start_n(["START"])
+    detect["detect_intent<br/>初回報告を記録し、事前承認2フラグを<br/>キーワードで決定的に判定"]
+    rec{{"reception_agent(LLM)<br/>聞き取り → IntakeResult<br/>status / 不足項目 / draft"}}
+    iroute{"intake_router<br/>必須6項目と system_id を自前で検証"}
+    ask["ask_reporter ★停止<br/>RequestInput「intake-N」"]
+    collect["collect_answer"]
+    rroute{"review_router ─ HITL ゲート1(起票前レビュー)<br/>propose_case_draft でドラフト登録"}
+    rgate["review_gate ★停止「case-review-N」<br/>起票内容を提示して確認待ち"]
+    rdec{"review_decision"}
+    file["file_case<br/>create_support_case → Firestore(support_cases)<br/>update_case_status(investigating)"]
+    inv{{"investigation_agent(LLM)<br/>get_system_status / get_server_logs<br/>search_past_incidents / search_runbooks<br/>→ RecoveryPlan"}}
+    proute{"plan_router ─ HITL ゲート2(復旧承認)<br/>propose_recovery_plan で計画登録"}
+    pgate["plan_gate ★停止「recovery-approval-N」<br/>復旧計画を提示して承認待ち"]
+    adec{"approval_decision"}
+    eroute{"exec_router"}
+    restart["restart_node<br/>restart_server"]
+    esc["escalate_node<br/>escalate_to_engineer"]
+    record(["record_node【終端】<br/>record_resolution_log → Firestore(incident_logs)<br/>update_case_status(resolved / escalated)"])
+    halt_n(["halt<br/>中断理由を報告して終了(出力なし)"])
+
+    start_n --> detect --> rec --> iroute
+    iroute -->|ASK| ask
+    ask --> collect
+    collect -.->|後退エッジ| rec
+    iroute -->|READY| rroute
+    rroute -->|"ASK(システム特定不能)"| ask
+    rroute -->|NEEDS_REVIEW| rgate --> rdec
+    rdec -->|APPROVE| file
+    rdec -.->|"REVISE(訂正して聞き直し)"| rec
+    rroute -->|"PRE_APPROVED(ゲート1を迂回)"| file
+    file -->|FILED| inv --> proute
+    file -->|FAILED| halt_n
+    proute -->|NEEDS_APPROVAL| pgate --> adec
+    adec -->|APPROVED| eroute
+    adec -->|DENIED| halt_n
+    proute -->|"PRE_APPROVED(ゲート2を迂回)"| eroute
+    eroute -->|RESTART| restart
+    eroute -->|ESCALATE| esc
+    restart -->|OK| record
+    esc -->|OK| record
+    restart -->|FAILED| halt_n
+    esc -->|FAILED| halt_n
+
+    classDef llm fill:#e8f0fe,stroke:#1a73e8,color:#174ea6
+    classDef gate fill:#fef7e0,stroke:#f9ab00,stroke-width:2px,color:#7f5700
+    classDef done fill:#e6f4ea,stroke:#188038,color:#0d652d
+    classDef stop fill:#fce8e6,stroke:#d93025,color:#a50e0e
+    class rec,inv llm
+    class ask,rgate,pgate gate
+    class record done
+    class halt_n stop
 ```
 
+★ = `RequestInput` でワークフローが**実際に停止**する HITL ポイント。
+点線は後退エッジ(聞き取りへの差し戻し)。
+
 **HITL の要点(二重ゲートは2箇所)**:
-`create_support_case` は `propose_case_draft`(起票前レビュー)を、
-`restart_server` / `escalate_to_engineer` は `propose_recovery_plan` を
-通していないとツール側でエラー返却(**指示層 + ツール層の二重ゲート**)。
+`RequestInput` はワークフローを**実際に停止**させるため、
+承認を経ずに `restart_server` / `escalate_to_engineer` へ到達する経路が
+**グラフ上に存在しない**。加えて従来どおりツール層の state チェックも残してあり
+(`create_support_case` は `propose_case_draft` を、実施系は `propose_recovery_plan` を
+通していないとエラー返却)、**グラフ構造 + ツール層の二重防御**になっている。
 初回依頼文に「以上の内容で対応をお願いします」「そのまま実施してください」等の
-**明示的な続行指示・事前承認**があれば、提示直後に連続実行する運用も可能。
+**明示的な続行指示・事前承認**があれば、`detect_intent` のキーワード判定で
+該当ゲートを迂回して一気通貫で完走する(ワンショットのデモ・eval はこの経路)。
+
+### システム構成
+
+```mermaid
+flowchart LR
+    reporter(["店舗の報告者 / 運用担当者"])
+    cli["agents-cli run / adk web"]
+
+    subgraph wf["app/ — ADK 2.x Workflow(sre_incident_workflow)"]
+        nodes["graph/nodes.py<br/>関数ノード(起票 / HITLゲート / 実施 / 記録)"]
+        rec2["reception_agent<br/>single_turn → IntakeResult"]
+        inv2["investigation_agent<br/>single_turn → RecoveryPlan"]
+    end
+
+    subgraph tls["app/tools/"]
+        case_t["case_tools"]
+        diag_t["diagnostic_tools"]
+        know_t["knowledge_tools"]
+        rem_t["remediation_tools"]
+        gcp_l["gcp_logs"]
+        gcp_a["gcp_assist(MCP)"]
+    end
+
+    subgraph localdata["ローカルデータ"]
+        mock["mock_world.py<br/>疑似システム5種"]
+        rb["data/runbooks/<br/>運用手順書7本"]
+    end
+
+    subgraph gcpsvc["GCP"]
+        vertex["Vertex AI<br/>gemini-3.5-flash"]
+        fs[("Firestore「sre-agents」<br/>support_cases / incident_logs")]
+        bq[("BigQuery<br/>sre_agents_demo_logs.syslog")]
+        mcp["Gemini Cloud Assist<br/>リモートMCP(読み取りのみ)"]
+        gce["Compute Engine<br/>instances.reset"]
+    end
+
+    reporter <--> cli --> nodes
+    nodes --> rec2
+    nodes --> inv2
+    rec2 --> vertex
+    inv2 --> vertex
+    nodes --> case_t
+    nodes --> know_t
+    nodes --> rem_t
+    rec2 --> diag_t
+    inv2 --> case_t
+    inv2 --> diag_t
+    inv2 --> know_t
+    inv2 -.-> gcp_l
+    inv2 -.-> gcp_a
+    case_t --> fs
+    know_t --> fs
+    know_t --> rb
+    diag_t --> mock
+    rem_t --> mock
+    rem_t -.-> gce
+    gcp_l -.-> bq
+    gcp_a -.-> mcp
+
+    classDef llm fill:#e8f0fe,stroke:#1a73e8,color:#174ea6
+    classDef ext fill:#f1f3f4,stroke:#5f6368,color:#202124
+    class rec2,inv2 llm
+    class vertex,fs,bq,mcp,gce ext
+```
+
+点線は `SANDBOX_PROJECT_ID` を設定したときだけ有効になる経路
+(GCP調査ツールの組み込みと、`restart_server` の GCE 実リセット)。
+未設定なら、すべてモックデータの範囲で完結する。
 
 ## デモシナリオ
 
@@ -113,7 +217,7 @@ GCP障害シナリオ(store-app / store-web-fleet)を使う場合のみ `SANDBOX
 | `make chat` | サーバー起動+ワンショット。続きは `agents-cli run --session-id <ID> "..."` |
 | `make welcome` | ウェルカム画面の確認(受付が「SRE エージェントへようこそ」を返す) |
 | `make playground` | `adk web` の対話 UI(ブラウザで動作確認) |
-| `make test` | ユニットテスト(LLM 非依存、45 件) |
+| `make test` | ユニットテスト(LLM 非依存、108 件) |
 | `make eval` | `agents-cli eval run`(generate + grade、5 ケース) |
 | `make eval-compare BASE=... CAND=...` | 2 つの grade 結果の回帰比較 |
 | `make lint` | ruff / format / codespell / ty のチェック |
@@ -164,11 +268,13 @@ make run PROMPT="渋谷店ですが、売上管理システムの調子が悪く
 make run PROMPT="池袋店(店舗ID:2205)の田中です。在庫管理システムで今朝7時半ごろから在庫照会に30秒近くかかり、断続的にエラーも出ています。店内の発注端末2台で発生していて、棚卸作業が止まっています。"
 ```
 
-→ 必須項目は揃っているが続行指示がないため、受付が **propose_case_draft で
-   起票内容を提示して停止(報告者の確認待ち)**。起票・調査はまだ行わない。
+→ 必須項目は揃っているが続行指示がないため、**review_gate が起票内容を提示して
+   ワークフローが停止(報告者の確認待ち)**。起票・調査はまだ行わない。
    続きは同セッションで確認を返す:
    `agents-cli run "はい、その内容でお願いします。" --session-id <表示されたID>`
-   → 起票 → 調査 → propose_recovery_plan 提示 → 承認待ち、と多段HITLで進む。
+   → 起票 → 調査 → plan_gate で計画提示 → 承認待ち、と多段HITLで進む。
+   (`RequestInput` による停止からの再開手順は `agents-cli run` では未検証。
+   ワンショットのデモ 3・4 は事前承認でゲートを迂回するため影響を受けない。)
 
 ### 3. 完全報告 + 続行指示(承認待ち経路)
 
@@ -176,8 +282,8 @@ make run PROMPT="池袋店(店舗ID:2205)の田中です。在庫管理システ
 make run PROMPT="渋谷店(店舗ID:1102)の佐藤です。売上管理システムで今朝9時ごろからレジの会計時に「売上データの送信がタイムアウトしました」というエラーが出ます。店内のレジ2台すべてで発生していて、他の業務は正常です。報告内容は以上の通りで間違いありませんので、このまま起票して原因の調査と対応方針の提案を進めてください。復旧作業の実施は私の承認を得てから進めてください。"
 ```
 
-→ 受付が内容を提示しつつ**続行指示ありと判断して同一応答内で起票** → 調査 →
-   **propose_recovery_plan で計画提示 → 停止して承認待ち**。`restart_server` は呼ばれない。
+→ `detect_intent` が**続行指示ありと判断して起票前レビューを迂回**し、起票 → 調査 →
+   **plan_gate で計画提示 → ワークフローが停止して承認待ち**。`restart_server` は呼ばれない。
 
 ### 4. 完全報告 + 事前承認(フル自走)
 
@@ -368,10 +474,15 @@ sre-agents/
 │   ├── config.py                    # MODEL_ID, FIRESTORE_DATABASE, RUNBOOK_DIR, SANDBOX_PROJECT_ID
 │   ├── firestore_client.py          # named DB "sre-agents" の遅延シングルトン
 │   ├── mock_world.py                # 疑似システム5種の決定論的レジストリ
+│   ├── graph/                       # ★ ADK 2.x グラフワークフロー
+│   │   ├── __init__.py              # build_workflow():ノードとエッジの組み立て
+│   │   ├── nodes.py                 # 関数ノード(起票 / 承認ゲート / 実施 / 記録)
+│   │   ├── preapproval.py           # 事前承認のキーワード判定(LLM を介在させない)
+│   │   └── schemas.py               # IntakeResult / CaseFiled / RecoveryPlan 等
 │   ├── sub_agents/
 │   │   ├── __init__.py              # build_model / build_generate_content_config
-│   │   ├── reception.py             # 受付エージェント(日本語 instruction)
-│   │   └── investigation.py         # 調査エージェント(HITL 手順を厳守)
+│   │   ├── reception.py             # 受付エージェント(聞き取り結果を構造化して返す)
+│   │   └── investigation.py         # 調査エージェント(復旧計画を構造化して返す)
 │   └── tools/
 │       ├── case_tools.py            # propose_case_draft(起票前レビュー)+ create/get/update support_case
 │       ├── diagnostic_tools.py      # list_managed_systems / get_system_status / get_server_logs
@@ -388,10 +499,12 @@ sre-agents/
 │   ├── gce_incident_startup/        # store-web-* の起動スクリプト(base.sh / incident.sh)
 │   └── inventory_incident.sh        # 在庫管理APサーバー役 GCE(inventory-mgmt)の create/status/resolve/clean
 ├── tests/
-│   ├── unit/                        # ユニットテスト 45 件(LLM 非依存)
+│   ├── unit/                        # ユニットテスト 108 件(LLM 非依存)
 │   │   ├── test_mock_world.py       # レジストリ整合性
 │   │   ├── test_search_logic.py     # キーワード検索の純関数
-│   │   ├── test_agent_wiring.py     # エージェント配線
+│   │   ├── test_agent_wiring.py     # グラフの配線(ノード / エッジ / モデル)
+│   │   ├── test_graph_flow.py       # 事前承認判定・各ルーターの分岐・停止イベント
+│   │   ├── test_eval_metrics.py     # eval の決定論メトリクスの検出力
 │   │   ├── test_gcp_assist.py       # Cloud Assist MCP 連携の配線(ネットワーク非依存)
 │   │   ├── test_gce_scenario.py     # GCEシナリオ(実リセット経路 / BigQueryツール)
 │   │   ├── test_hitl_gating.py      # HITL ゲート(propose なしなら実施拒否)
@@ -399,6 +512,7 @@ sre-agents/
 │   ├── integration/                 # (scaffold の雛形。今は未使用)
 │   └── eval/
 │       ├── eval_config.yaml         # カスタムメトリクス 3 本(LLM判定 2 + 決定論 1)
+│       ├── make_negative_trace.py   # 違反を注入したネガティブコントロールの生成
 │       └── datasets/basic-dataset.json # 5 ケース
 └── working/
     ├── implementation-log.md        # 実装作業ログ
