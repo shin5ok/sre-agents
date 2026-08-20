@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SRE障害対応エージェント(受付→調査のパイプライン)のアプリ定義。"""
+"""SRE障害対応エージェント(受付→起票→調査→復旧のワークフロー)のアプリ定義。"""
 
 import os
 
@@ -27,9 +27,9 @@ os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "True"
 
 from google.adk.apps import App
 
-from app.sub_agents.reception import create_reception_agent
+from app.graph import build_workflow
 
-root_agent = create_reception_agent()
+root_agent = build_workflow()
 
 app = App(
     root_agent=root_agent,

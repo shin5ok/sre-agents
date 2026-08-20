@@ -647,3 +647,92 @@ investigation_agent から調査・復旧できるようにする(旧「未実�
 - 注: SPEC.md のフロー(「必要な情報が揃ったら起票」)には起票前レビューの記述が
   ないため、本変更はユーザー指示によるフロー拡張として本ログと README に記録
   (SPEC 側は未改訂)。
+
+---
+
+## 2026-08-04: ADK 2.x graph-based workflow への書き換え
+
+**ゴール**: `app/` を階層エージェント構成(`root_agent = reception_agent` +
+`sub_agents=[investigation_agent]` + `transfer_to_agent`)から
+ADK 2.x の **`Workflow` グラフ**へ移す。HITL の2ゲートを「instruction 頼みの
+ソフトな停止」から「グラフ構造として破れない停止」に変える。
+
+### 粒度(合意事項)
+
+LLM に残す判断は「聞き取り」と「原因調査」の2ノードだけ。起票・承認ゲート・
+復旧の実施・対応ログ記録は関数ノードに出して、グラフのエッジで決定的に流す。
+ワンショットのデモ・eval を壊さないため、事前承認は `detect_intent` の
+キーワード判定で該当ゲートを迂回する(LLM を承認判断に介在させない)。
+
+### 追加・変更点
+
+- `app/graph/`(新規)— `schemas.py`(`IntakeResult` / `CaseFiled` /
+  `RecoveryPlan` 等)、`preapproval.py`(事前承認2フラグの純関数判定)、
+  `nodes.py`(関数ノード全部)、`__init__.py`(`build_workflow()`)。
+- `app/sub_agents/`: 両エージェントを `mode="single_turn"` + `output_schema` に。
+  受付は `include_contents='default'` を明示(既定の `'none'` だと後退エッジで
+  戻るたびに聞き取りが全部落ちる)。実施系ツールは調査エージェントから外した。
+- `app/tools/` は**未変更**。ADK 2.x の `Context` が `state` インターフェースを
+  そのまま備えているので `tool_context=ctx` で既存ツールを呼べる。おかげで
+  ツール層のゲート(`create_support_case` / 実施系)がそのまま生き、
+  `test_hitl_gating.py` と `test_intake_review.py` は無修正で通る。
+
+### ハマりどころ(実測で判明)
+
+- **`Event(message="<str>")` は role="user" の Content になる**。関数ノードの
+  発話が全部ユーザー発話扱いになり、UI でも eval の応答抽出でもエージェントの
+  発話として扱われなかった。`_say()` で `role="model"` の Content を組む。
+- **ゲートは `RequestInput` を先に、本文の Event を後に yield する**。逆だと
+  停止時の最後のイベントが `adk_request_input` の function_call だけになり、
+  agents-cli の応答抽出(最後のイベントの `parts[0].text`)が KeyError で落ちる。
+  `BaseNode.run` は `RequestInput` の後もジェネレータを消費し続けるので安全。
+- **eval のトレースには `author` と `content` しか載らない**
+  (`_evals_common.py:3112`)。当初計画していた `step_*` の `state_delta`
+  マーカーも `node_info.path` も**トレースに出ない**ので判定に使えない。
+- 逆に **`instance["prompt"]` は custom_function から読める**
+  (`_evals_metric_handlers.py:905-916`)。これで依頼文の事前承認を
+  決定論メトリクス側でも判定できるようになった。
+
+### eval メトリクスの作り直し
+
+グラフ化で `propose_case_draft` / `create_support_case` /
+`propose_recovery_plan` / 実施系 / `record_resolution_log` /
+`transfer_to_agent` が**トレースの function_call から消える**ため、
+`sre_trajectory_checks` を次の3つの手掛かりで書き直した:
+
+1. `author`(`investigation_agent` のイベント = 調査に入った証拠)
+2. `function_call`(調査系ツールは今も LLM 呼び出し。`adk_request_input` の
+   id `intake-N` / `case-review-N` / `recovery-approval-N` が停止位置)
+3. 関数ノードが出す定型テキスト(`# 起票内容の確認` / `…を起票しました` /
+   `# 対応計画` / `# 対応結果のご報告` / `実施した対応: …`)
+
+依頼文から事前承認を判定するようにしたことで、**旧構成では検出できず LLM 判定
+2本に頼っていた HITL 違反(`propose_awaits_approval` の承認前実施)を
+決定論チェックでも落とせるようになった**(1.000 → 0.900)。
+LLM 判定2本のプロンプトも、`transfer_to_agent` 前提と「同一応答内で連続実行」の
+説明をグラフ構造の記述に差し替えた。
+
+- `tests/eval/make_negative_trace.py`: 判定関数の写しを廃止し、
+  `eval_config.yaml` から直接読み込んで exec する方式に変更(ズレなくなる)。
+  5つの `mutate_*` も新しいトレース形状(定型テキスト / 停止イベント)向けに再実装。
+- `tests/unit/test_eval_metrics.py`(新規21件): 事前承認のキーワード表が
+  `app/graph/preapproval.py` と一致すること、定型テキストがノードの実際の文面と
+  一致すること、注入した違反が期待どおりのスコアに落ちることを検証。
+  片方だけ直すとメトリクスが「常に満点」に退化するので、ここで押さえる。
+
+### 検証結果
+
+- `make test` 108件 green(HITL ゲート2本は無修正で通過 = ツール層の防御が生きている)。
+- `make lint` green(ruff / format / codespell / ty)。
+- グラフ構築スモーク: 18ノード、`validate_graph()` 通過。
+- **偽モデル + Firestore スタブでの4経路実測**(GCP課金なし):
+  事前承認あり=完走 / 起票前レビュー停止 / 聞き取り停止 / 復旧承認停止。
+  4経路すべてで応答抽出が成功し、決定論メトリクスが停止位置
+  (`intake-1` / `case-review-1` / `recovery-approval-1`)と到達フェーズを
+  正しく検出することを確認。
+- **`make eval` は未実行**(GCP課金のためユーザー側で実施)。eval 設定の
+  書き換えは実トレースでの確認が1回必要。
+- 注: SPEC.md はエージェント2体のパイプラインを規定しており、責務分担
+  (受付=聞き取りと起票、調査=原因特定と復旧)は保っているが、
+  **起票・復旧実施・記録の実行主体が LLM からグラフへ移った**点は
+  SPEC の記述とずれる(SPEC 側は未改訂)。

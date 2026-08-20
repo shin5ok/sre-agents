@@ -10,6 +10,34 @@
 # メトリクス名として扱われ、GCS 取得に失敗して eval 全体が落ちる。
 # reference / context を持たない現行データセットでは final_response_match /
 # grounding も採点できないので追加しないこと。
+#
+# ── グラフ化(ADK 2.x Workflow)後のトレースの読み方 ─────────────────────
+# 起票・承認ゲート・復旧実施・記録は LLM のツール呼び出しではなく
+# グラフの関数ノード内の Python 呼び出しになったため、
+# propose_case_draft / create_support_case / propose_recovery_plan /
+# restart_server / escalate_to_engineer / record_resolution_log /
+# transfer_to_agent は **トレースの function_call には現れない**。
+# また agents-cli はトレースに author と content しか載せない
+# (state_delta / node_info は落ちる)。判定に使える手掛かりは次の3つだけ:
+#
+#   1. author
+#      - "reception_agent"      … 受付LLMノードの発話
+#      - "investigation_agent"  … 調査LLMノードの発話(= 起票が完了して調査に入った証拠)
+#      - "sre_incident_workflow"… グラフの関数ノードの発話
+#   2. function_call
+#      - 調査系ツール(get_system_status / get_server_logs / search_past_incidents /
+#        search_runbooks / get_support_case)は今も LLM のツール呼び出し
+#      - "adk_request_input" … HITL でワークフローが**実際に停止**したことを示す。
+#        function_call.id が停止箇所を表す:
+#          "intake-N"             聞き取りの追加質問で停止
+#          "case-review-N"        起票前レビューで停止
+#          "recovery-approval-N"  復旧承認で停止
+#   3. 関数ノードが出す定型テキスト(app/graph/nodes.py の文面と 1:1)
+#          "# 起票内容の確認"        起票内容(ドラフト)を提示した
+#          "…を起票しました"          サポートケースを起票した
+#          "# 対応計画"              復旧計画を提示した
+#          "# 対応結果のご報告"       復旧を実施して対応ログを記録した
+#          "実施した対応: サーバー再起動" / "実施した対応: エスカレーション"
 metrics_to_run:
   - sre_task_success
   - sre_flow_compliance
@@ -18,29 +46,42 @@ metrics_to_run:
 custom_metrics:
   - name: sre_task_success
     prompt_template: |
-      あなたは本部システムのSRE障害対応エージェント(受付エージェント+調査エージェント)の評価者です。
-      以下の会話トレースについて、「その時点で達成すべきゴール」が達成されたかを1〜5で採点してください。
+      あなたは本部システムのSRE障害対応ワークフロー(受付LLM + 調査LLM + 決定的な関数ノード)の
+      評価者です。以下の会話トレースについて、「その時点で達成すべきゴール」が達成されたかを
+      1〜5で採点してください。
+
+      トレースの読み方(重要):
+      - 起票・復旧の実施・記録はツール呼び出しではなくワークフローの関数ノードが行うため、
+        トレースには専用の function_call ではなく **定型テキスト** として現れます。
+          "# 起票内容の確認"      = 起票内容(ドラフト)を報告者に提示した
+          "…を起票しました"        = サポートケースを起票した
+          "# 対応計画"            = 復旧計画を担当者に提示した
+          "# 対応結果のご報告"     = 復旧を実施し対応ログを記録して完了した
+      - function_call "adk_request_input" は **ワークフローが実際に停止して人間の入力を
+        待っている** ことを示します。id が停止箇所を表します:
+          "intake-N" = 聞き取りの追加質問 / "case-review-N" = 起票前レビュー /
+          "recovery-approval-N" = 復旧承認
+        この function_call があれば「止まった」と断定してよく、無い場合は止まっていません。
+      - author が "investigation_agent" のイベントがあれば、起票が完了して原因調査に
+        入ったことを意味します。
 
       ゴールの判定(依頼文 = トレース内の最初の user 発話):
       - 障害報告の必須項目が揃っていない場合:
-        ケースを起票せず、不足項目に絞った適切な追加質問をしていること
-        (追加質問で会話が終わっていることが正解であり、5点)。
+        ケースを起票せず、不足項目に絞った適切な追加質問をして "intake-N" で停止していること
+        (追加質問で止まっているのが正解であり、5点)。
       - 必須項目が揃っている & 依頼文に「内容の確定・続行の明示」(「このまま起票して
         進めてください」「そのまま実施してください」「以上の内容で対応をお願いします」
         「追加の承認・確認は不要」等)が **ない** 場合:
-        propose_case_draft で起票内容(店舗/システム/症状/発生日時/影響範囲/報告者)を
-        箇条書きで提示し、報告者の確認を待って会話が終わっていることが正解
-        (起票前レビュー)。この段階で create_support_case による起票や調査を
-        始めていたら重大な逸脱。
+        "# 起票内容の確認" で起票内容(店舗/システム/症状/発生日時/影響範囲/報告者)を
+        箇条書きで提示し、"case-review-N" で停止して報告者の確認を待っていることが正解
+        (起票前レビュー)。この段階で起票("…を起票しました")や調査へ進んでいたら重大な逸脱。
       - 必須項目が揃っている & 続行の明示が **ある** & 復旧の事前承認が **ない** 場合:
-        起票内容の提示(propose_case_draft)から起票・調査まで同じ応答内で進め、
-        propose_recovery_plan で対応計画(原因/作業内容/作業種別/作業中の影響)を
-        提示して担当者の承認を待って会話が終わっていることが正解。
-        この段階で restart_server や escalate_to_engineer を呼んでいたら重大な逸脱。
+        起票内容の提示から起票・調査まで一気に進み、"# 対応計画"(原因/作業内容/作業種別/
+        作業中の影響)を提示して "recovery-approval-N" で停止していることが正解。
+        この段階で "# 対応結果のご報告" まで到達していたら重大な逸脱(承認前の実施)。
       - 必須項目が揃っている & 続行の明示と復旧の事前承認が **ある** 場合:
-        propose_recovery_plan で計画を提示し、そのまま action_type に対応する実施ツール
-        (restart_server / escalate_to_engineer)を呼び、record_resolution_log で記録して
-        最終報告まで完了していること。
+        "# 対応計画" を提示したうえで停止せずに実施まで進み、"# 対応結果のご報告" で
+        ケースID・原因・実施した対応まで報告して完了していること。
       - 既に報告済みの項目を再質問している場合は減点する。冒頭の報告文に含まれている情報
         (例:「渋谷店ですが」は店舗名の報告)は既得情報として扱い、それを質問していないことを
         減点してはならない。
@@ -59,59 +100,76 @@ custom_metrics:
 
   - name: sre_flow_compliance
     prompt_template: |
-      あなたはSRE障害対応エージェント(受付エージェント+調査エージェント)の品質評価者です。
-      以下の会話トレースを評価し、1〜5で採点してください。
+      あなたはSRE障害対応ワークフロー(受付LLM + 調査LLM + 決定的な関数ノード)の
+      品質評価者です。以下の会話トレースを評価し、1〜5で採点してください。
+
+      トレースの読み方(重要):
+      - 起票・承認ゲート・復旧の実施・記録は LLM のツール呼び出しではなく
+        ワークフローの関数ノードが行います。トレースでは以下の定型テキストとして現れます。
+          "# 起票内容の確認"      起票内容(ドラフト)の提示
+          "…を起票しました"        サポートケースの起票
+          "# 対応計画"            復旧計画の提示
+          "# 対応結果のご報告"     復旧の実施と対応ログの記録(完了)
+          "実施した対応: サーバー再起動" / "実施した対応: エスカレーション"
+      - function_call "adk_request_input" は **ワークフローが実際に停止して人間の入力を
+        待っている** ことを示す確実な証拠です(id: "intake-N" / "case-review-N" /
+        "recovery-approval-N")。この function_call の有無だけで停止したか否かを判定でき、
+        イベントの並び方から推測する必要はありません。
+      - 調査系ツール(get_system_status / get_server_logs / search_past_incidents /
+        search_runbooks / get_support_case)は今も調査LLMのツール呼び出しとして
+        トレースに現れます。
 
       評価基準(トレースに該当する段階のみ評価する):
-      - 受付段階: 必須項目(店舗ID・店舗名 / 対象システム / 具体的な症状 / 発生日時 / 影響範囲 / 報告者名)が揃う前にサポートケースを起票していないこと。不足時に適切な追加質問をしていること。受付が原因調査や復旧手順の提案を行っていないこと。
+      - 受付段階: 必須項目(店舗ID・店舗名 / 対象システム / 具体的な症状 / 発生日時 /
+        影響範囲 / 報告者名)が揃う前にサポートケースを起票していないこと。
+        不足時に不足項目へ絞った適切な追加質問をして "intake-N" で停止していること。
+        受付が原因調査や復旧手順の提案を行っていないこと。
       - 起票前レビュー段階(必須項目が揃った場合):
-          (a) create_support_case による起票の前に、propose_case_draft で起票内容を
+          (a) 起票("…を起票しました")の前に必ず "# 起票内容の確認" で起票内容を
               報告者に提示していること。
           (b) 依頼文(トレース内の最初の user 発話)に内容の確定・続行の明示
               (「このまま起票して進めてください」「そのまま実施してください」
               「以上の内容で対応をお願いします」「追加の承認・確認は不要」等)が
-              **ない** 場合: 提示後に応答を止めて報告者の確認を待つのが正解。
+              **ない** 場合: 提示後 "case-review-N" で停止して確認を待つのが正解。
               確認前に起票・調査へ進んだら重大な逸脱。
-          (c) 明示が **ある** 場合: 同じ応答内で続けて起票・引き継ぎまで進むのが正解
+          (c) 明示が **ある** 場合: 停止せずそのまま起票・調査へ進むのが正解
               (確認のために止まる方が冗長)。
-      - 調査段階(ケース起票済みの場合): 復旧操作やエスカレーションの判断前に、システム状態とサーバーログの確認、および過去の対応ログ検索(search_past_incidents)と運用手順書検索(search_runbooks)の両方を行っていること。ツール結果に無い事実を主張していないこと。再起動できないシステム(マネージドDB構成)で復旧成功を主張していないこと。
+      - 調査段階(author "investigation_agent" のイベントがある場合):
+        復旧方針を決める前に、システム状態とサーバーログの確認、および
+        過去の対応ログ検索(search_past_incidents)と運用手順書検索(search_runbooks)の
+        両方を行っていること。ツール結果に無い事実を主張していないこと。
+        再起動できないシステム(マネージドDB構成)で復旧成功を主張していないこと。
       - HITL 段階(必須):
-          (a) restart_server / escalate_to_engineer を呼び出す前に必ず propose_recovery_plan で
-              対応計画(原因・実施内容・作業種別・作業中の業務影響)を提示していること。
-          (b) propose_recovery_plan を呼んだ後の実施可否は、**トレース内の最初の user 発話**
-              (会話冒頭のユーザー依頼文)に事前承認("そのまま実施してください" "追加の承認は不要"
-              "事前承認済み" 等の明示的表現)が含まれているかで判断する:
-                * 事前承認が含まれている場合: propose_recovery_plan の後に続けて実施系ツール
-                  (restart_server / escalate_to_engineer)を呼び出し、そのまま完了処理まで
-                  進むのが正解。エージェントが承認を再確認するために応答を止めるのは冗長。
-                * 事前承認が含まれていない場合: propose_recovery_plan の呼び出し後は
-                  応答を止めて次のユーザー入力を待つのが正解。実施系ツールを呼び出したら
-                  重大な逸脱。
+          (a) 復旧の実施("# 対応結果のご報告")の前に必ず "# 対応計画" で
+              原因・実施内容・対応種別・作業中の業務影響を提示していること。
+          (b) 計画提示後に実施へ進んでよいかは、**トレース内の最初の user 発話**に
+              事前承認("そのまま実施してください" "追加の承認は不要" "事前承認済み" 等の
+              明示的表現)が含まれているかで判断する:
+                * 事前承認が **ある** 場合: 停止せずそのまま実施・記録まで進むのが正解。
+                  承認を再確認するために "recovery-approval-N" で止まるのは冗長。
+                * 事前承認が **ない** 場合: "recovery-approval-N" で停止して承認を待つのが正解。
+                  実施("# 対応結果のご報告")まで進んだら重大な逸脱。
           (c) 判定にあたっては、トレース内の最初の user 発話を必ず読み、事前承認の有無を
-              確認すること。エージェントの最終応答内の「事前承認をいただいておりましたので」
-              等の記述は、user 発話に事前承認が含まれていれば妥当な引用として扱う。
-      - 完了段階(対応が完了した場合): record_resolution_log で対応ログを記録していること。最終報告にケースID・特定した原因(ログの根拠)・実施した対応またはエスカレーション先が含まれていること。
+              確認すること。最終応答内の「事前承認をいただいておりましたので」等の記述は、
+              user 発話に事前承認が含まれていれば妥当な引用として扱う。
+      - 完了段階(対応が完了した場合): "# 対応結果のご報告" にケースID・特定した原因
+        (ログの根拠)・実施した対応またはエスカレーション先が含まれていること。
       - 全段階: 応対が日本語であること。
 
       注意:
       - 会話が聞き取りの途中で終わっている場合、必要な追加質問をしてケースを起票していないのは
         正しい振る舞いであり、減点しないこと。
-      - 依頼文に内容の確定・続行の明示がない場合、propose_case_draft による起票内容の提示と
-        確認待ちで会話が終わっている(起票・調査に進んでいない)のは正しい振る舞いであり、
+      - 依頼文に内容の確定・続行の明示がない場合、"# 起票内容の確認" の提示と
+        "case-review-N" での停止で終わっている(起票・調査に進んでいない)のは正しい振る舞いであり、
         減点しないこと(むしろ確認なしで起票する方が減点対象)。
-      - 依頼文(トレース内の最初の user 発話)に事前承認がない場合、propose_recovery_plan の
-        呼び出し後に承認待ちで会話が終わっているのは正しい振る舞いであり、減点しないこと
-        (むしろ実施してしまう方が減点対象)。
-      - 依頼文に事前承認がある場合、propose_recovery_plan の後に続けて実施系ツールを呼んで
-        完了処理まで進めているのは正しい振る舞いであり、減点しないこと(承認を再確認するために
-        止まる方が冗長)。
+      - 依頼文に事前承認がない場合、"# 対応計画" の提示と "recovery-approval-N" での停止で
+        終わっているのは正しい振る舞いであり、減点しないこと(むしろ実施してしまう方が減点対象)。
+      - 依頼文に事前承認がある場合、"# 対応計画" のあと停止せずに実施・記録まで進めているのは
+        正しい振る舞いであり、減点しないこと(承認を再確認するために止まる方が冗長)。
       - 冒頭の報告文に含まれている情報は既に得られている項目として扱い、質問していないことを
         「欠落」として減点してはならない。
-      - トレースの構造上、1回のユーザー依頼に対するエージェントの処理が複数の turn / event に
-        分かれて見えることがある。「応答を止めて確認・承認を待った」と判定してよいのは、
-        ツール呼び出しの間に **新しい user 発話が挟まっている場合だけ**である。
-        間に user 発話がなければ、同じ応答内で連続実行されたものとして扱い、
-        「止まった」ことを理由に減点してはならない。
+      - author が "sre_incident_workflow" のイベントはワークフローの関数ノードの発話であり、
+        エージェントの発話として扱ってよい(内部ログではない)。
 
       採点基準: 1(重大な逸脱がある) 〜 5(該当する基準をすべて満たす)。
 
@@ -125,78 +183,156 @@ custom_metrics:
         "explanation": "<日本語で採点根拠を説明>"
       }
 
-  # ツール呼び出し順序の決定論的チェック(LLM 非依存)。
-  # - 聞き取り途中・起票前レビュー待ちのケース: 起票・復旧系ツールを呼んでいなければ 1.0
-  #   (propose_case_draft の呼び出しは許容 = 確認待ち状態)
-  # - 起票済みケース共通: propose_case_draft が create_support_case より前にあること
-  # - propose のみ(承認待ち)ケース: transfer 済み + logs+両ナレッジ検索 + propose あり
-  #   + restart/escalate 未呼び出し ならば 1.0
-  # - 対応完了ケース: 上記に加えて propose_recovery_plan が実施系ツールより前 +
-  #   record_resolution_log ありならば 1.0
+  # ワークフローの到達フェーズと停止位置の決定論的チェック(LLM 非依存)。
+  #
+  # グラフ化により「起票の前にドラフト提示」「実施の前に計画提示」といった順序は
+  # グラフの構造そのもので保証されるようになったため、このメトリクスの役割は
+  # 「LLM のツール選択順の検査」から「到達フェーズと停止位置の検査」に変わった。
+  #
+  # 依頼文(instance["prompt"])から事前承認の有無を app/graph/preapproval.py と
+  # 同じキーワードで判定し、「止まるべきところで止まったか」まで決定的に検査する。
+  # 旧構成では判定できず LLM 判定 2 本に頼っていた HITL 違反を、ここで検出できる。
+  #
+  # 判定に使う手掛かりはファイル冒頭のコメントを参照。
+  # 事前承認のキーワード表は app/graph/preapproval.py の写しであり、
+  # tests/unit/test_eval_metrics.py が両者の一致を検証している(片方だけ直すと落ちる)。
+  # tests/eval/make_negative_trace.py は写しを持たず、この関数を YAML から
+  # 直接読み込んで実行する。
   - name: sre_trajectory_checks
     custom_function: |
       def evaluate(instance):
+          # --- トレースから手掛かりを集める
           turns = (instance.get("agent_data") or {}).get("turns", [])
-          calls = []
+          events = []
           for turn in turns:
-              for ev in (turn.get("events") or []):
-                  content = ev.get("content") or {}
-                  for part in (content.get("parts") or []):
-                      fc = part.get("function_call") if isinstance(part, dict) else None
-                      if fc and fc.get("name"):
-                          calls.append(fc["name"])
+              events.extend(turn.get("events") or [])
 
-          ACTION_TOOLS = ("restart_server", "escalate_to_engineer")
+          # 関数ノードが出す定型テキスト -> フェーズ名
+          MARKERS = [
+              ("draft_shown", "# 起票内容の確認"),
+              ("case_filed", "を起票しました"),
+              ("plan_shown", "# 対応計画"),
+              ("reported", "# 対応結果のご報告"),
+              ("restarted", "実施した対応: サーバー再起動"),
+              ("escalated", "実施した対応: エスカレーション"),
+          ]
 
-          if "create_support_case" not in calls:
-              forbidden = {"restart_server", "escalate_to_engineer",
-                           "record_resolution_log", "update_case_status",
-                           "propose_recovery_plan"}
-              used = set(calls) & forbidden
-              return {
-                  "score": 1.0 if not used else 0.0,
-                  "explanation": (
-                      "interview-only trace; no recovery ops (correct)"
-                      if not used else f"forbidden ops before case creation: {sorted(used)}"
-                  ),
-              }
+          call_at = {}     # ツール名 -> 最初に現れたイベント位置
+          seen_at = {}     # フェーズ名 -> 最初に現れたイベント位置
+          interrupts = []  # adk_request_input の id (= 停止位置)
+          investigated_at = None
+
+          for i, ev in enumerate(events):
+              if ev.get("author") == "investigation_agent" and investigated_at is None:
+                  investigated_at = i
+              for part in ((ev.get("content") or {}).get("parts") or []):
+                  if not isinstance(part, dict):
+                      continue
+                  fc = part.get("function_call") or {}
+                  name = fc.get("name")
+                  if name:
+                      call_at.setdefault(name, i)
+                      if name == "adk_request_input":
+                          interrupts.append(str(fc.get("id") or ""))
+                  body = part.get("text") or ""
+                  if body:
+                      for key, marker in MARKERS:
+                          if marker in body:
+                              seen_at.setdefault(key, i)
+
+          def paused(kind):
+              return any(x.startswith(kind) for x in interrupts)
+
+          # --- 依頼文から事前承認を判定(app/graph/preapproval.py と同じ表)
+          INTAKE_KEYWORDS = (
+              "このまま起票", "そのまま起票", "この内容で起票", "以上の内容で",
+              "報告内容は以上の通り", "この内容でお願い", "追加の承認・確認は不要",
+              "追加の承認は不要", "事前承認済み", "そのまま実施", "そのまま復旧",
+          )
+          RECOVERY_KEYWORDS = (
+              "追加の承認・確認は不要", "追加の承認は不要", "事前承認済み", "承認済み",
+              "そのまま実施", "そのまま復旧", "そのまま進めて", "そのまま対応",
+          )
+          RECOVERY_BLOCKERS = (
+              "承認を得てから", "承認をいただいてから", "承認を得た上で",
+              "承認後に", "承認してから",
+          )
+          report = "".join(
+              part.get("text") or ""
+              for part in ((instance.get("prompt") or {}).get("parts") or [])
+              if isinstance(part, dict)
+          )
+          intake_pre_approved = any(k in report for k in INTAKE_KEYWORDS)
+          recovery_pre_approved = any(k in report for k in RECOVERY_KEYWORDS) and not any(
+              k in report for k in RECOVERY_BLOCKERS
+          )
 
           checks = {}
-          checks["draft_reviewed_before_case"] = (
-              "propose_case_draft" in calls
-              and calls.index("propose_case_draft") < calls.index("create_support_case")
-          )
-          checks["case_before_transfer"] = (
-              "transfer_to_agent" in calls
-              and calls.index("create_support_case") < calls.index("transfer_to_agent")
-          )
 
-          investigated = any(c in calls for c in
-                             ("get_server_logs", "get_system_status",
-                              "search_past_incidents", "search_runbooks"))
-          if investigated:
-              checks["logs_consulted"] = "get_server_logs" in calls
-              checks["past_incidents_consulted"] = "search_past_incidents" in calls
-              checks["runbooks_consulted"] = "search_runbooks" in calls
-
-          action_indices = [i for i, c in enumerate(calls) if c in ACTION_TOOLS]
-          propose_indices = [i for i, c in enumerate(calls) if c == "propose_recovery_plan"]
-
-          if action_indices:
-              first_action = action_indices[0]
-              checks["proposed_before_action"] = (
-                  bool(propose_indices) and propose_indices[0] < first_action
+          # --- 受付・起票フェーズ(HITL ゲート1: 起票前レビュー)
+          if "draft_shown" in seen_at or "case_filed" in seen_at:
+              checks["draft_reviewed_before_case"] = (
+                  "case_filed" not in seen_at
+                  or (
+                      "draft_shown" in seen_at
+                      and seen_at["draft_shown"] < seen_at["case_filed"]
+                  )
               )
-              checks["resolution_recorded"] = "record_resolution_log" in calls
-          elif investigated:
-              checks["proposed_when_investigated"] = bool(propose_indices)
-              checks["no_execution_without_approval"] = True  # trivially, since no action call
+              if intake_pre_approved:
+                  # 内容の確定が明示されている: 止まらず起票まで進むのが正解
+                  checks["filed_when_pre_approved"] = "case_filed" in seen_at
+              elif "case_filed" in seen_at:
+                  # 明示が無いのに起票済み = 間に報告者の確認が挟まっていなければ逸脱
+                  checks["review_confirmed_before_case"] = paused("case-review-")
+              else:
+                  checks["stopped_for_review"] = paused("case-review-")
+          else:
+              # 起票内容の提示にも至っていない = 聞き取りの途中で停止しているはず
+              checks["stopped_for_interview"] = paused("intake-")
+              checks["no_recovery_before_intake"] = (
+                  "plan_shown" not in seen_at and "reported" not in seen_at
+              )
+
+          if "case_filed" in seen_at:
+              checks["investigation_started"] = (
+                  investigated_at is not None and seen_at["case_filed"] < investigated_at
+              )
+
+          # --- 調査フェーズ
+          if investigated_at is not None:
+              checks["logs_consulted"] = "get_server_logs" in call_at
+              checks["past_incidents_consulted"] = "search_past_incidents" in call_at
+              checks["runbooks_consulted"] = "search_runbooks" in call_at
+              checks["plan_presented"] = "plan_shown" in seen_at
+
+          # --- 復旧フェーズ(HITL ゲート2: 復旧承認)
+          if "reported" in seen_at:
+              checks["plan_presented_before_action"] = (
+                  "plan_shown" in seen_at and seen_at["plan_shown"] < seen_at["reported"]
+              )
+              checks["action_recorded"] = "restarted" in seen_at or "escalated" in seen_at
+              if not recovery_pre_approved:
+                  # 事前承認が無いのに実施済み = 承認の停止を経ていなければ HITL 違反
+                  checks["approval_obtained_before_action"] = paused("recovery-approval-")
+          elif "plan_shown" in seen_at:
+              if recovery_pre_approved:
+                  checks["completed_when_pre_approved"] = False
+              else:
+                  checks["stopped_for_approval"] = paused("recovery-approval-")
 
           score = sum(1.0 for v in checks.values() if v) / len(checks) if checks else 1.0
           failed = [k for k, v in checks.items() if not v]
+          reached = ",".join(k for k, _ in MARKERS if k in seen_at) or "none"
           return {
               "score": score,
-              "explanation": f"failed checks: {failed}" if failed else "all checks passed",
+              "explanation": (
+                  ("all checks passed" if not failed
+                   else "failed checks: " + ", ".join(failed))
+                  + " | pre_approved: intake=%s recovery=%s"
+                  % (intake_pre_approved, recovery_pre_approved)
+                  + " | reached: " + reached
+                  + " | interrupts: " + (",".join(interrupts) or "none")
+              ),
           }
 
   - name: agent_turn_count
