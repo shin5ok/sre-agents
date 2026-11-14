@@ -2,18 +2,20 @@
 # (SPEC の要件: よく使うコマンドはすべて make で実行できること)
 
 # PROJECT_ID は本リポジトリの GCP プロジェクト(Firestore の sre-agents DB がある場所)。
+# 既定値は .env の GOOGLE_CLOUD_PROJECT(書式は .env.example を参照)。
 # シェルに PROJECT_ID が export されていると ?= では環境変数側が勝ってしまい、
 # db-create / eval が無関係のプロジェクトを向いてしまうため、環境由来の値は無視する。
 # コマンドラインでの上書き(make PROJECT_ID=... )は従来どおり有効。
+DOTENV_PROJECT_ID := $(shell grep -E '^GOOGLE_CLOUD_PROJECT=' .env 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d "\"' \r")
 ifeq ($(origin PROJECT_ID), environment)
-PROJECT_ID := your-project-id
+PROJECT_ID := $(DOTENV_PROJECT_ID)
 endif
-PROJECT_ID ?= your-project-id
+PROJECT_ID ?= $(DOTENV_PROJECT_ID)
 REGION ?= asia-northeast1
 FIRESTORE_DB ?= sre-agents
 PROMPT ?= 渋谷店(店舗ID:1102)です。売上管理システムで今朝9時頃からレジ2台の会計時に売上送信がタイムアウトします。報告者は佐藤です。以上の内容で対応をお願いします。
 
-.PHONY: all install db-create seed run chat welcome playground test eval eval-compare eval-negative \
+.PHONY: all install check-project db-create seed run chat welcome playground test eval eval-compare eval-negative \
 	eval-gate eval-baseline lint deploy-setup deploy \
 	gcp-incident-create gcp-incident-status gcp-incident-resolve gcp-incident-clean \
 	gce-incident-create gce-incident-break gce-incident-status gce-incident-resolve gce-incident-clean \
@@ -29,8 +31,16 @@ install:
 	agents-cli install
 	uv sync --dev --extra eval --extra lint
 
+# PROJECT_ID が決まらないまま db-create / eval を走らせない
+# (空だと ADC 既定の無関係なプロジェクトを、.env.example のままだと存在しないプロジェクトを向く)
+check-project:
+	@if [ -z "$(PROJECT_ID)" ] || [ "$(PROJECT_ID)" = "your-project-id" ]; then \
+		echo "PROJECT_ID が未設定です。.env の GOOGLE_CLOUD_PROJECT に実際のプロジェクトIDを書くか、make PROJECT_ID=<project> で指定してください。"; \
+		exit 1; \
+	fi
+
 # Firestore named database の作成(初回のみ。作成済みならエラーを無視)
-db-create:
+db-create: check-project
 	gcloud firestore databases create --database=$(FIRESTORE_DB) --location=$(REGION) --type=firestore-native --project=$(PROJECT_ID) || true
 
 # 過去対応ログのモックデータ投入(冪等)
@@ -67,7 +77,7 @@ test:
 # GOOGLE_CLOUD_PROJECT: Firestore(sre-agents DB)のあるプロジェクトを明示する。
 # eval の inference runner は .env を override=False で読むため、シェルに別プロジェクトが
 # export されていると .env より優先され、Firestore 403 で調査系ケースが全滅する。
-eval:
+eval: check-project
 	SANDBOX_TOOLS_DISABLED=1 GOOGLE_CLOUD_PROJECT=$(PROJECT_ID) agents-cli eval run
 
 # eval 結果の比較(make eval-compare BASE=... CAND=...)
@@ -92,7 +102,7 @@ eval-gate:
 eval-baseline:
 	scripts/eval_gate.sh --update-baseline $(RESULTS)
 
-eval-negative:
+eval-negative: check-project
 	@test -n "$(TRACES)" || { echo "no trace file found; run 'make eval' first or pass TRACES=..."; exit 1; }
 	uv run python tests/eval/make_negative_trace.py $(TRACES)
 	SANDBOX_TOOLS_DISABLED=1 GOOGLE_CLOUD_PROJECT=$(PROJECT_ID) agents-cli eval grade \

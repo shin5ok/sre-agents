@@ -194,12 +194,14 @@ LLM は「ログの異常 → 過去事例 → 手順書」の 3 点が同じ結
 - **Google Cloud SDK**: `gcloud` にログインし ADC を有効化(`gcloud auth application-default login`)
 
 ```bash
+cp .env.example .env   # GOOGLE_CLOUD_PROJECT を自分のプロジェクトIDに書き換える
 make install     # agents-cli~=0.5.0 を tool install + uv sync(dev/eval/lint 全部)
 make db-create   # Firestore named DB "sre-agents"(asia-northeast1)を作成 [初回のみ]
 make seed        # 過去対応ログ 7 件を投入(冪等)
 ```
 
-GCP プロジェクトは環境変数 `GOOGLE_CLOUD_PROJECT` で指定。未設定なら ADC から自動解決。
+GCP プロジェクトは `.env` の `GOOGLE_CLOUD_PROJECT` で指定する(`make db-create` / `make eval` も
+この値を使う。`make PROJECT_ID=...` で上書き可)。エージェント本体は未設定なら ADC から自動解決する。
 Firestore の named database 名は `FIRESTORE_DATABASE`(既定: `sre-agents`)。
 GCP障害シナリオ(store-app / store-web-fleet)を使う場合のみ `SANDBOX_PROJECT_ID` を設定する(後述)。
 参考は [`.env.example`](./.env.example)。
